@@ -1,6 +1,7 @@
 from src.states.base import State
 import time
 import numpy as np
+import cv2
 
 class BattleState(State):
     """
@@ -32,13 +33,13 @@ class BattleState(State):
         Executes battle instructions, like auto-battle or macros.
         """
         # Monitor health bars for emergency macros
-        if self.is_low_health(image):
-            self.execute_healing_macro()
-        else:
-            # Standard battle action: tap 'e' for Auto-battle or confirm
-            self.controller.tap('e')
+        # if self.is_low_health(image):
+        #     self.execute_healing_macro()
+        # else:
+        #     # Standard battle action: tap gamepad A button for Auto-battle or confirm
+        self.controller.tap("gamepad_a")
         
-        time.sleep(0.5)
+        time.sleep(0.2)
 
     def is_low_health(self, image) -> bool:
         """

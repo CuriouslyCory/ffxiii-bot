@@ -110,3 +110,34 @@ class VisionEngine:
         x, y, w, h = roi
         return image[y:y+h, x:x+w]
 
+    def draw_roi(self, image: np.ndarray, roi: Tuple[int, int, int, int], label: str = "", color: Tuple[int, int, int] = (0, 255, 0)):
+        """
+        Draws an ROI rectangle on the image for debugging.
+        
+        :param image: Image to draw on.
+        :param roi: (x, y, width, height).
+        :param label: Text label for the ROI.
+        :param color: BGR color of the rectangle.
+        """
+        x, y, w, h = roi
+        cv2.rectangle(image, (x, y), (x + w, y + h), color, 2)
+        if label:
+            cv2.putText(image, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+    def draw_match(self, image: np.ndarray, match: Tuple[int, int, float], template_name: str, color: Tuple[int, int, int] = (0, 0, 255)):
+        """
+        Draws a match result on the image for debugging.
+        
+        :param image: Image to draw on.
+        :param match: (x, y, confidence) from find_template.
+        :param template_name: Name of the template that was matched.
+        :param color: BGR color of the marker.
+        """
+        x, y, conf = match
+        template = self.templates[template_name]
+        h, w = template.shape[:2]
+        
+        cv2.rectangle(image, (x, y), (x + w, y + h), color, 2)
+        label = f"{template_name} ({conf:.2f})"
+        cv2.putText(image, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+

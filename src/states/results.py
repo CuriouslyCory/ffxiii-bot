@@ -28,7 +28,7 @@ class ResultsState(State):
         # is_stats = self.vision.find_template("stats_label", image, threshold=0.8, roi=(0, 0, 960, 540))
         # is_spoils = self.vision.find_template("spoils_label", image, threshold=0.8, roi=(0, 0, 960, 540))
         
-        # Tap 'e' to progress
-        self.controller.tap('e')
-        time.sleep(1.0)
+        # Tap gamepad A button to progress
+        self.controller.tap("gamepad_a")
+        time.sleep(0.2)
 
