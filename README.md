@@ -27,32 +27,17 @@ Automation bot for Final Fantasy XIII that uses computer vision to detect game s
 
 ## Gamepad Setup
 
-### Debugging Gamepad Button Mapping
-
-To identify which buttons correspond to which indices on your gamepad, use the debug utility:
-
-```bash
-python src/debug-controller.py
-```
-
-This will display:
-- Button presses/releases with their indices
-- Axis movements (analog sticks, triggers)
-- Hat/D-pad movements
-
-Press buttons on your gamepad to see their mappings. The utility will show you which button index corresponds to which physical button.
+The bot uses `vgamepad` to emulate an Xbox 360 controller. This should work out-of-the-box on most systems.
 
 ### Gamepad Permissions (Linux)
 
-If you encounter permission errors when sending gamepad inputs, you may need to:
+If you encounter permission errors when creating the virtual gamepad, you may need to:
 
-1. Add your user to the `input` group:
+1. Add your user to the `input` group or ensure you have permissions to access `/dev/uinput` (if used by the backend):
    ```bash
    sudo usermod -a -G input $USER
    ```
    (Requires logout/login to take effect)
-
-2. Or run with appropriate permissions
 
 ## Usage
 

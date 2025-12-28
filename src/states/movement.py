@@ -5,7 +5,7 @@ import json
 import cv2
 import numpy as np
 from pynput import keyboard
-from src.db import init_db, save_route, load_route, list_routes, set_active_route, get_active_route, clear_active_route
+from src.db import init_db, save_route, update_route_landmarks, load_route, list_routes, set_active_route, get_active_route, clear_active_route
 
 LANDMARK_DIR = "templates/landmarks"
 
@@ -33,8 +33,8 @@ class MovementState(State):
         self.seek_start_time = 0
         self.seek_last_toggle_time = 0
         self.seek_vertical_direction = 1  # 1 = down, -1 = up
-        self.seek_pan_speed = 0.35  # Right stick X value for panning
-        self.seek_tilt_speed = 1  # Right stick Y value for tilting
+        self.seek_pan_speed = 0.25  # Right stick X value for panning
+        self.seek_tilt_speed = 0.15  # Right stick Y value for tilting
         
         # Input flags
         self.req_record_mode = False
@@ -101,7 +101,7 @@ class MovementState(State):
 
     def on_exit(self):
         self.listening = False
-        self.controller.release('w')
+        self.controller.move_character(0.0, 0.0)
         self.controller.move_camera(0.0, 0.0) # Stop camera movement explicit
         self.controller.release_all() # Safety release all
         try: cv2.destroyWindow("Landmark Preview") 
@@ -156,6 +156,13 @@ class MovementState(State):
              self.req_select_route = None
              if self.mode == "SELECTING":
                  self.select_route(idx)
+             elif self.mode == "PLAYBACK":
+                 if idx == 2:
+                     self.delete_landmark(self.current_landmark_idx)
+                 elif idx == 3:
+                     if self.landmarks:
+                         next_idx = (self.current_landmark_idx + 1) % len(self.landmarks)
+                         self.delete_landmark(next_idx)
         if self.req_playback:
             self.req_playback = False
             self.start_playback()
@@ -227,6 +234,40 @@ class MovementState(State):
                 print("[ERROR] Failed to load route.")
         else:
             print("[ERROR] Invalid selection.")
+
+    def delete_landmark(self, index):
+        if not self.landmarks: return
+        
+        if 0 <= index < len(self.landmarks):
+            deleted = self.landmarks.pop(index)
+            print(f"[DELETE] Removed landmark {index}: {deleted['name']}")
+            
+            # Adjust current index
+            if index < self.current_landmark_idx:
+                self.current_landmark_idx -= 1
+            elif index == self.current_landmark_idx:
+                # If we deleted the last one, wrap to 0, else stay at same index (which is now next)
+                if self.current_landmark_idx >= len(self.landmarks):
+                    self.current_landmark_idx = 0
+                
+                # Reset search state since target changed
+                self.search_start_time = time.time()
+                self.reset_seek_state()
+                self.last_seen_time = 0 # Prevent blind movement
+            
+            # Save to DB
+            if self.current_route_id:
+                if update_route_landmarks(self.current_route_id, self.landmarks):
+                     print("[SAVED] Updated route in database.")
+                else:
+                     print("[ERROR] Failed to update route in database.")
+                
+                # Update active state
+                if self.landmarks:
+                     set_active_route(self.current_route_id, self.current_landmark_idx)
+                else:
+                     print("[WARN] Route is now empty.")
+                     self.stop_all()
 
     def start_playback(self):
         if not self.landmarks:
@@ -314,7 +355,7 @@ class MovementState(State):
             return
         
         # Toggle vertical direction every 7 seconds
-        if current_time - self.seek_last_toggle_time >= 7.0:
+        if current_time - self.seek_last_toggle_time >= 4.5:
             self.seek_vertical_direction *= -1  # Flip between -1 (up) and 1 (down)
             direction_name = "down" if self.seek_vertical_direction > 0 else "up"
             print(f"[SEEK] Toggling tilt direction: {direction_name}")
@@ -340,25 +381,49 @@ class MovementState(State):
         target_name = target['name']
         
         # Look for current landmark
-        match = self.vision.find_template(target_name, image, threshold=0.7)
+        match = self.vision.find_template(target_name, image, threshold=0.75)
         
-        # Look for NEXT landmark
-        next_idx = (self.current_landmark_idx + 1) % len(self.landmarks)
-        next_target = self.landmarks[next_idx]
-        next_match = self.vision.find_template(next_target['name'], image, threshold=0.7)
+        # Continuously check for next landmarks to skip ahead if visible
+        # This allows skipping multiple nodes if the path is clear or curved
+        max_lookahead = len(self.landmarks)
         
-        if next_match:
-            print(f"[PLAYBACK] Found next landmark {next_idx} ({next_target['name']}). Switching target.")
-            self.current_landmark_idx = next_idx
-            match = next_match
-            target_name = next_target['name']
-            self.search_start_time = time.time()
-            self.reset_seek_state() # Found it, reset seek logic
-            if self.current_route_id:
-                set_active_route(self.current_route_id, self.current_landmark_idx)
+        for _ in range(max_lookahead):
+            next_idx = (self.current_landmark_idx + 1) % len(self.landmarks)
+            next_target = self.landmarks[next_idx]
+            
+            # Check if next landmark is visible
+            next_match = self.vision.find_template(next_target['name'], image, threshold=0.75)
+            if next_match:
+                print(f"Next match confidence: {next_match[2]}")
+
+            if next_match:
+                print(f"[PLAYBACK] Found next landmark {next_idx} ({next_target['name']}). Skipping ahead.")
+                # Advance to this landmark
+                self.current_landmark_idx = next_idx
+                match = next_match
+                target_name = next_target['name']
+                
+                # Update state
+                self.search_start_time = time.time()
+                self.reset_seek_state() 
+                if self.current_route_id:
+                    set_active_route(self.current_route_id, self.current_landmark_idx)
+            else:
+                # Next landmark not visible, stop advancing
+                break
 
         # Show debug visualization with bounding box
-        self._show_debug_view(image, match, target_name)
+        current_target = self.landmarks[self.current_landmark_idx]
+        
+        # Determine next target for display (re-calculate to ensure it's the one AFTER current)
+        next_disp_idx = (self.current_landmark_idx + 1) % len(self.landmarks)
+        next_disp_target = self.landmarks[next_disp_idx]
+        
+        self._show_debug_view(
+            image, match, target_name, 
+            target_filename=current_target['filename'],
+            next_target_filename=next_disp_target['filename']
+        )
 
         if match:
             self.reset_seek_state() # Found it, reset seek logic
@@ -376,15 +441,16 @@ class MovementState(State):
             
             # Proportional camera control with deadzone
             # Scale movement based on distance from center for smoother tracking
-            max_offset_x = w // 3  # Scale factor for X
+            max_offset_x = w // 4  # Scale factor for X (Increased to smooth out ramp)
             max_offset_y = h // 3  # Scale factor for Y
+            max_speed = 0.35       # Cap maximum speed to prevent abrupt movements
             
             if abs(dx) > deadzone:
                 # Proportional control: further from center = faster movement
                 # dx < 0 (LEFT of center) -> look LEFT (cam_x negative)
                 # dx > 0 (RIGHT of center) -> look RIGHT (cam_x positive)
                 proportion = min(1.0, abs(dx) / max_offset_x)
-                cam_x = -proportion if dx < 0 else proportion
+                cam_x = (-proportion if dx < 0 else proportion) * max_speed
             else:
                 cam_x = 0.0
                 
@@ -392,18 +458,23 @@ class MovementState(State):
                 # dy < 0 (ABOVE center) -> look UP (cam_y negative)
                 # dy > 0 (BELOW center) -> look DOWN (cam_y positive)
                 proportion = min(1.0, abs(dy) / max_offset_y)
-                cam_y = -proportion if dy < 0 else proportion
+                cam_y = (-proportion if dy < 0 else proportion) * max_speed
             else:
                 cam_y = 0.0
             
             # Apply camera movement (both axes simultaneously)
             self.controller.move_camera(cam_x, cam_y)
             
-            if abs(dx) < 200: self.controller.press('w')
-            else: self.controller.release('w')
+            if abs(dx) < 200: self.controller.move_character(0.0, 1.0)
+            else: self.controller.move_character(0.0, 0.0)
                 
         else:
-            self.controller.release('w')
+            # Check for persistence (blindly move forward for 2 seconds)
+            if time.time() - self.last_seen_time < 2.0:
+                 self.controller.move_character(0.0, 1.0)
+            else:
+                 self.controller.move_character(0.0, 0.0)
+
             # If lost for > 3 seconds, start seeking
             if time.time() - self.search_start_time > 3.0:
                 self.execute_seek()
@@ -411,13 +482,15 @@ class MovementState(State):
                 # Only stop camera if NOT seeking (let seek control the camera)
                 self.controller.move_camera(0.0, 0.0)
 
-    def _show_debug_view(self, image, match, target_name: str):
+    def _show_debug_view(self, image, match, target_name: str, target_filename: str = None, next_target_filename: str = None):
         """
         Displays a debug window showing the captured image with landmark detection overlay.
         
         :param image: Current captured frame
         :param match: Match tuple (x, y, confidence) or None
         :param target_name: Name of the current target landmark
+        :param target_filename: Filename of the target landmark image
+        :param next_target_filename: Filename of the next target landmark image
         """
         # Scale down for display (50%)
         scale = 0.5
@@ -459,9 +532,67 @@ class MovementState(State):
         cv2.putText(debug_img, f"Landmark {self.current_landmark_idx + 1}/{len(self.landmarks)}", 
                    (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
+        # Combine with target image if available
+        final_img = debug_img
+        
+        if target_filename:
+            path = os.path.join(LANDMARK_DIR, target_filename)
+            if os.path.exists(path):
+                target_img = cv2.imread(path)
+                
+                # Check next target
+                next_target_img = None
+                if next_target_filename:
+                    next_path = os.path.join(LANDMARK_DIR, next_target_filename)
+                    if os.path.exists(next_path):
+                        next_target_img = cv2.imread(next_path)
+                
+                if target_img is not None:
+                    # Resize target to be larger (e.g. 1.5x original 150 -> 225)
+                    t_scale = 1.5
+                    th, tw = target_img.shape[:2]
+                    new_th, new_tw = int(th * t_scale), int(tw * t_scale)
+                    target_img = cv2.resize(target_img, (new_tw, new_th))
+                    
+                    if next_target_img is not None:
+                        next_target_img = cv2.resize(next_target_img, (new_tw, new_th))
+                    
+                    # Create canvas
+                    padding = 20
+                    # Match height to debug_img or target_img stack, whichever is larger
+                    targets_h = 40 + new_th + (40 + new_th if next_target_img is not None else 0) + 20
+                    canvas_h = max(dh, targets_h)
+                    canvas_w = dw + new_tw + padding * 2
+                    
+                    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+                    
+                    # Place debug image
+                    canvas[0:dh, 0:dw] = debug_img
+                    
+                    # Place target image
+                    tx = dw + padding
+                    ty = 40
+                    
+                    # Draw label
+                    cv2.putText(canvas, "CURRENT TARGET:", (tx, ty - 10), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                               
+                    if ty + new_th <= canvas_h:
+                        canvas[ty:ty+new_th, tx:tx+new_tw] = target_img
+                        
+                    # Place next target image
+                    if next_target_img is not None:
+                        ty_next = ty + new_th + 40
+                        cv2.putText(canvas, "NEXT TARGET:", (tx, ty_next - 10), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                        if ty_next + new_th <= canvas_h:
+                            canvas[ty_next:ty_next+new_th, tx:tx+new_tw] = next_target_img
+                        
+                    final_img = canvas
+
         # Show window
         win = "FFXIII Bot - Debug"
-        cv2.imshow(win, debug_img)
+        cv2.imshow(win, final_img)
         
         # Position to right of game window (once)
         if not hasattr(self, '_debug_win_pos'):

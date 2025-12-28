@@ -10,5 +10,5 @@ dependencies = [
     "opencv-python>=4.11.0.86",
     "pynput>=1.8.1",
     "pygame>=2.6.0",
-    "evdev>=1.6.1",
+    "vgamepad>=0.1.0",
 ]

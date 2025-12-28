@@ -53,6 +53,25 @@ def save_route(name, landmarks):
     finally:
         conn.close()
 
+def update_route_landmarks(route_id, landmarks):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        # Delete old landmarks
+        c.execute("DELETE FROM landmarks WHERE route_id = ?", (route_id,))
+        
+        # Insert new ones
+        for idx, lm in enumerate(landmarks):
+            c.execute("INSERT INTO landmarks (route_id, step_order, template_name, filename) VALUES (?, ?, ?, ?)",
+                      (route_id, idx, lm['name'], lm['filename']))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error updating route {route_id}: {e}")
+        return False
+    finally:
+        conn.close()
+
 def load_route(route_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -101,4 +120,3 @@ def clear_active_route():
     c.execute("DELETE FROM active_state WHERE key = 'current_route'")
     conn.commit()
     conn.close()
-
