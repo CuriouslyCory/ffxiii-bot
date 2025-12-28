@@ -179,7 +179,7 @@ class Controller:
         """
         if not self.virtual_gamepad: return
 
-        print(f"Moving camera: x={x}, y={y}")
+        # print(f"Moving camera: x={x}, y={y}")
         
         # Standard Xbox 360 mapping:
         # Right Stick X: Horizontal
