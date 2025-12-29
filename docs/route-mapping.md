@@ -2,20 +2,24 @@
 
 ## Overview
 
-The Route Mapping system allows the FFXIII bot to navigate the open world autonomously by following a sequence of visual landmarks. Since the game does not provide accessible coordinate data, this system relies on computer vision (Template Matching) to recognize specific visual features in the environment and orient the character towards them.
+The Route Mapping system allows the FFXIII bot to navigate the open world autonomously. The system now supports two distinct navigation methods:
+1.  **Landmark Routing**: Visual navigation using template matching to recognize environment features.
+2.  **Keylog Routing**: Time-based replay of user inputs (movement and camera).
 
 ## Core Concepts
 
-### 1. Visual Landmarks
-Instead of (x, y) coordinates, a "node" in a path is a 150x150 pixel image of a distinct object or texture in the game world (e.g., a specific rock, a signpost, a distant mountain peak).
+### 1. Visual Landmarks (Landmark Routing)
+A "node" in a path is a 150x150 pixel image of a distinct object or texture in the game world. The bot navigates by finding these targets on screen, centering them, and moving forward.
 
-### 2. The Path
-A route is simply an ordered list of these landmarks. The bot navigates by:
-1.  Finding the current target landmark on screen.
-2.  Rotating the camera to center the landmark.
-3.  Moving forward while keeping it centered.
-4.  Scanning for the *next* landmark in the list.
-5.  Seamlessly switching targets when the next one becomes visible.
+### 2. Keylog Events (Keylog Routing)
+A route consists of a precise timeline of key press and release events.
+-   **Movement**: WASD keys.
+-   **Camera**: Numpad keys (2, 4, 6, 8) mapped to the Right Analog Stick.
+    -   `2`: Pan Down
+    -   `8`: Pan Up
+    -   `4`: Pan Left
+    -   `6`: Pan Right
+-   **Overlap Support**: The system records overlapping inputs (e.g., holding `W` to run while tapping `6` to look right), ensuring complex movement patterns are replicated faithfully.
 
 ## Usage Guide
 
@@ -23,72 +27,80 @@ A route is simply an ordered list of these landmarks. The bot navigates by:
 
 1.  **Enter Movement State**: Ensure you are in the open world (minimap visible).
 2.  **Start Recording**: Press **`r`**.
-    - A "Landmark Preview" window will appear, showing the center crop of your screen.
-3.  **Capture Landmarks**:
-    - Navigate your character manually.
-    - Center a distinct object in your view.
-    - Press **`t`** to capture it as a landmark.
-    - *Tip: Landmarks should be relatively close to each other (3-5 seconds of running distance).*
-4.  **Correct Mistakes**:
-    - If you take a bad picture, don't move. Press **`g`** to retake (overwrite) the last captured landmark.
-5.  **Finish**:
-    - Press **`y`** when done.
-    - The bot will pause and ask for a **Route Name** in the terminal window.
-    - Enter a name and press Enter. The route is saved to the database.
+3.  **Select Type**:
+    -   Press **`1`** for **Landmark Routing**.
+    -   Press **`2`** for **Keylog Routing**.
+
+#### Option A: Landmark Routing
+1.  **Capture Landmarks**:
+    -   Navigate manually. Center a distinct object.
+    -   Press **`t`** to capture it as a landmark.
+    -   *Tip: Landmarks should be relatively close (3-5s distance).*
+2.  **Correct Mistakes**: Press **`g`** to retake the last captured landmark.
+3.  **Finish**: Press **`y`**. Enter a name in the terminal when prompted.
+
+#### Option B: Keylog Routing
+1.  **Record Movement**:
+    -   Move your character using **WASD**.
+    -   Control camera using **Numpad 2, 4, 6, 8**.
+    -   *Note: Recording pauses automatically if you enter a battle or menu, and resumes when you return to the open world.*
+2.  **Finish**: Press **`y`**. Enter a name in the terminal when prompted.
 
 ### Playing a Path
 
 1.  **Select Route**:
-    - Press **`p`** to list available routes in the terminal.
-    - Press the corresponding number key (**`1-9`**) to load a route.
+    -   Press **`p`**.
+    -   Select Filter: **`1`** (Landmark) or **`2`** (Keylog).
+    -   Press the number key (**`1-9`**) corresponding to the route you wish to load.
 2.  **Start/Resume**:
-    - Press **`u`** to begin navigation.
+    -   Press **`u`** to begin navigation.
+    -   **Resume Logic**:
+        -   **Landmark**: Attempts to find the last known target.
+        -   **Keylog**: Pauses playback when entering battle. Upon returning to the open world, it waits **3 seconds** before resuming. It reconstructs the state of held keys (e.g., if you were holding `W` and looking right when battle started) and continues the timeline.
 3.  **Stop**:
-    - Press **`ESC`** to stop playback/recording immediately.
+    -   Press **`ESC`** to stop playback/recording immediately.
+
+### Managing Routes (Review & Delete Images)
+*Note: Management is currently only supported for Landmark Routes.*
+
+1.  **Select Route**: Press **`m`**, select route ID.
+2.  **Navigation**:
+    -   **`[` / `]`**: Previous / Next Step.
+    -   **`,` / `.`**: Previous / Next Image.
+3.  **Editing**: **`x`** to toggle deletion mark.
+4.  **Save/Exit**: **`s`** to save, **`ESC`** to cancel.
 
 ## Technical Architecture
 
 ### Database Storage
-Routes are stored in a SQLite database (`data/routes.db`). This allows for:
--   **Persistence**: Routes survive bot restarts.
--   **Management**: Multiple routes can be stored and named.
--   **State Tracking**: The current route progress (index) is saved to the `active_state` table. If the bot crashes or is stopped, it can resume exactly where it left off.
+Routes are stored in `data/routes.db`.
+-   **Routes Table**: Stores metadata and route `type` ('LANDMARK' or 'KEYLOG').
+-   **Keylog Events**: Stores precise `time_offset` and `event_type` ('down'/'up') for each key.
+-   **State Tracking**: Current progress (step index or event index) is saved to `active_state`. This allows the bot to resume routes after a crash or restart.
 
-### Navigation Logic
+### Navigation Logic (Landmark)
+Uses a look-ahead system to detect the next target while moving towards the current one, creating smooth curves. Includes a complex seek/recovery algorithm (360° scan) if the target is lost.
 
-#### Look-Ahead System
-To prevent "stop-and-turn" behavior, the bot employs a look-ahead mechanism. While moving towards Landmark A, it is actively searching for Landmark B. As soon as Landmark B is detected with sufficient confidence, the bot abandons A and starts moving towards B. This creates smooth, continuous curves in movement.
-
-#### Camera Control
-The system uses a virtual controller's right analog stick for camera panning. The `move_camera(x, y)` function sends axis values to the virtual gamepad:
--   `x`: -1.0 (Left) to 1.0 (Right)
--   `y`: -1.0 (Up) to 1.0 (Down)
--   **Linux Specifics**: The bot creates a virtual gamepad using evdev/uinput with `ABS_RX` and `ABS_RY` axes for camera control.
-
-#### Recovery Algorithm (Complex Seek)
-In FFXIII, entering a battle disorients the camera. When the bot returns to Movement State, it may be facing the wrong way. If the target landmark is not seen for 3 seconds, the bot enters a **Search Mode**:
-
-1.  **360° Horizontal Scan**: Pans right in 7 increments (1s hold, 1s wait).
-2.  **Down Phase**: Pans down (0.5s), then performs a 360° scan. Repeats 4 times.
-3.  **Up Phase**: Pans up (0.5s), then performs a 360° scan. Repeats 8 times.
-4.  **Failure**: If the landmark is not found after 2 full cycles of this pattern, the bot stops to prevent getting stuck in a loop.
+### Navigation Logic (Keylog)
+Uses an event-driven replay engine. It handles "drift" caused by pauses (battles) by shifting the start time anchor. Camera inputs (Numpad) are translated into virtual analog stick coordinates to emulate smooth controller movement.
 
 ## Key Bindings Summary
 
 | Key | Mode | Action |
 | :--- | :--- | :--- |
-| **`r`** | IDLE | Start Recording Mode |
-| **`t`** | RECORDING | Capture Landmark |
-| **`g`** | RECORDING | Retake Last Landmark |
-| **`y`** | RECORDING | Finish & Save |
-| **`p`** | IDLE | List & Select Routes |
+| **`r`** | IDLE | Start Recording (Select Type) |
+| **`p`** | IDLE | Playback Route (Select Type) |
+| **`m`** | IDLE | Manage Route (Landmark Only) |
 | **`u`** | IDLE | Start/Resume Playback |
-| **`ESC`** | ANY | Stop All Actions |
-| **`1-9`** | SELECTING | Select Route ID |
-
-## Why this approach?
-
--   **Robustness**: Works purely on visual data, making it independent of memory reading or coordinate injection which can be detected as cheating.
--   **Flexibility**: Users can create custom farming routes for any area of the game.
--   **Resilience**: The complex seek logic ensures the bot can recover from post-battle disorientation, which is critical for long-term automation.
-
+| **`ESC`** | ANY | Stop / Cancel |
+| **`1` / `2`** | MENU | Select Route Type (Landmark/Keylog) |
+| **`1-9`** | MENU | Select Route ID |
+| **`t`** | REC (Landmark) | Capture Landmark |
+| **`g`** | REC (Landmark) | Retake Last Landmark |
+| **`y`** | REC (Any) | Finish & Save |
+| **`WASD`** | REC (Keylog) | Move Character |
+| **`2,4,6,8`** | REC (Keylog) | Move Camera (Numpad) |
+| **`[` / `]`** | MANAGING | Prev/Next Step |
+| **`,` / `.`** | MANAGING | Prev/Next Image |
+| **`x`** | MANAGING | Toggle Delete Mark |
+| **`s`** | MANAGING | Save Changes |

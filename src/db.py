@@ -8,22 +8,26 @@ DB_PATH = "data/routes.db"
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     
-    # Check if we need to migrate/reset
-    # Simple approach: If schema is old, delete DB. 
-    # For now, per user instruction: "clear the database when we udpate teh schema"
-    # We will just force a fresh start if the new tables don't exist or if we want to enforce it.
-    # To be safe, let's just drop the tables we know about and recreate.
-    
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
     # Routes table
+    # Check if 'type' column exists, if not we might need to recreate or add it.
+    # Since we can just add it if missing:
     c.execute('''CREATE TABLE IF NOT EXISTS routes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT UNIQUE NOT NULL,
+        type TEXT DEFAULT 'LANDMARK', 
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
     
+    # Check if 'type' column exists (for migration)
+    try:
+        c.execute("SELECT type FROM routes LIMIT 1")
+    except sqlite3.OperationalError:
+        print("Migrating routes table: Adding 'type' column.")
+        c.execute("ALTER TABLE routes ADD COLUMN type TEXT DEFAULT 'LANDMARK'")
+
     # Steps table (ordered steps in a route)
     c.execute('''CREATE TABLE IF NOT EXISTS route_steps (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,6 +47,17 @@ def init_db():
         FOREIGN KEY (step_id) REFERENCES route_steps (id)
     )''')
     
+    # Keylog Events table
+    c.execute('''CREATE TABLE IF NOT EXISTS keylog_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        route_id INTEGER,
+        event_order INTEGER,
+        time_offset REAL,
+        event_type TEXT, -- 'down' or 'up'
+        key_char TEXT,
+        FOREIGN KEY (route_id) REFERENCES routes (id)
+    )''')
+    
     # Active Route state table
     c.execute('''CREATE TABLE IF NOT EXISTS active_state (
         key TEXT PRIMARY KEY,
@@ -52,31 +67,43 @@ def init_db():
     conn.commit()
     conn.close()
 
-def save_route(name, steps_data):
+def save_route(name, data, route_type="LANDMARK"):
     """
-    steps_data: list of dicts. 
-    Each dict represents a step: {
-        'name': str, 
-        'images': [ {'filename': str, 'name': str}, ... ] 
-    }
+    Saves a route to the database.
+    
+    If route_type is "LANDMARK":
+        data: list of dicts (steps). 
+        Each dict: {'name': str, 'images': [{'filename': str, 'name': str}, ...]}
+        
+    If route_type is "KEYLOG":
+        data: list of dicts (events).
+        Each dict: {'time_offset': float, 'event_type': str, 'key': str}
     """
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     try:
-        c.execute("INSERT INTO routes (name) VALUES (?)", (name,))
+        c.execute("INSERT INTO routes (name, type) VALUES (?, ?)", (name, route_type))
         route_id = c.lastrowid
         
-        for step_idx, step in enumerate(steps_data):
-            # Create Step
-            step_name = step.get('name', f"Step_{step_idx}")
-            c.execute("INSERT INTO route_steps (route_id, step_order, name) VALUES (?, ?, ?)",
-                      (route_id, step_idx, step_name))
-            step_id = c.lastrowid
-            
-            # Insert Images
-            for img in step.get('images', []):
-                c.execute("INSERT INTO step_images (step_id, filename, template_name) VALUES (?, ?, ?)",
-                          (step_id, img['filename'], img['name']))
+        if route_type == "LANDMARK":
+            steps_data = data
+            for step_idx, step in enumerate(steps_data):
+                # Create Step
+                step_name = step.get('name', f"Step_{step_idx}")
+                c.execute("INSERT INTO route_steps (route_id, step_order, name) VALUES (?, ?, ?)",
+                          (route_id, step_idx, step_name))
+                step_id = c.lastrowid
+                
+                # Insert Images
+                for img in step.get('images', []):
+                    c.execute("INSERT INTO step_images (step_id, filename, template_name) VALUES (?, ?, ?)",
+                              (step_id, img['filename'], img['name']))
+        
+        elif route_type == "KEYLOG":
+            events = data
+            for i, event in enumerate(events):
+                c.execute("INSERT INTO keylog_events (route_id, event_order, time_offset, event_type, key_char) VALUES (?, ?, ?, ?, ?)",
+                          (route_id, i, event['time_offset'], event['event_type'], event['key']))
         
         conn.commit()
         return True
@@ -91,14 +118,19 @@ def save_route(name, steps_data):
 
 def update_route_structure(route_id, steps_data):
     """
-    Replaces the entire step/image structure for a route.
+    Replaces the entire step/image structure for a LANDMARK route.
+    Does not currently support updating KEYLOG routes.
     """
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     try:
-        # Get existing step IDs to clean up images? 
-        # Easier to just delete all steps for this route (cascade would be nice but manual is safer here)
-        
+        # Check type
+        c.execute("SELECT type FROM routes WHERE id = ?", (route_id,))
+        res = c.fetchone()
+        if not res or res[0] != "LANDMARK":
+            print(f"Cannot update structure for route {route_id} (Type: {res[0] if res else 'None'})")
+            return False
+
         # 1. Find all steps for this route
         c.execute("SELECT id FROM route_steps WHERE route_id = ?", (route_id,))
         step_ids = [row[0] for row in c.fetchall()]
@@ -135,43 +167,65 @@ def load_route(route_id):
     c = conn.cursor()
     
     # Get Route
-    c.execute("SELECT name FROM routes WHERE id = ?", (route_id,))
+    c.execute("SELECT name, type FROM routes WHERE id = ?", (route_id,))
     res = c.fetchone()
     if not res: return None
     route_name = res[0]
+    route_type = res[1] if res[1] else "LANDMARK"
     
-    # Get Steps
-    c.execute("SELECT id, step_order, name FROM route_steps WHERE route_id = ? ORDER BY step_order ASC", (route_id,))
-    step_rows = c.fetchall()
+    result = {"id": route_id, "name": route_name, "type": route_type}
     
-    steps = []
-    for s_row in step_rows:
-        step_id = s_row[0]
-        step_order = s_row[1]
-        step_name = s_row[2]
+    if route_type == "LANDMARK":
+        # Get Steps
+        c.execute("SELECT id, step_order, name FROM route_steps WHERE route_id = ? ORDER BY step_order ASC", (route_id,))
+        step_rows = c.fetchall()
         
-        # Get Images for this step
-        c.execute("SELECT filename, template_name FROM step_images WHERE step_id = ?", (step_id,))
-        img_rows = c.fetchall()
-        images = [{"filename": r[0], "name": r[1]} for r in img_rows]
+        steps = []
+        for s_row in step_rows:
+            step_id = s_row[0]
+            step_order = s_row[1]
+            step_name = s_row[2]
+            
+            # Get Images for this step
+            c.execute("SELECT filename, template_name FROM step_images WHERE step_id = ?", (step_id,))
+            img_rows = c.fetchall()
+            images = [{"filename": r[0], "name": r[1]} for r in img_rows]
+            
+            steps.append({
+                "name": step_name,
+                "images": images
+            })
+        result["landmarks"] = steps
         
-        steps.append({
-            "name": step_name,
-            "images": images
-        })
-        
-    conn.close()
-    return {"id": route_id, "name": route_name, "landmarks": steps}
+    elif route_type == "KEYLOG":
+        c.execute("SELECT time_offset, event_type, key_char FROM keylog_events WHERE route_id = ? ORDER BY event_order ASC", (route_id,))
+        rows = c.fetchall()
+        events = [{"time_offset": r[0], "event_type": r[1], "key": r[2]} for r in rows]
+        result["events"] = events
 
-def list_routes():
+    conn.close()
+    return result
+
+def list_routes(route_type=None):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT id, name, created_at FROM routes ORDER BY created_at DESC")
+    query = "SELECT id, name, created_at, type FROM routes"
+    params = ()
+    if route_type:
+        query += " WHERE type = ?"
+        params = (route_type,)
+    
+    query += " ORDER BY created_at DESC"
+    
+    c.execute(query, params)
     routes = c.fetchall()
     conn.close()
     return routes
 
 def set_active_route(route_id, current_idx):
+    # current_idx for LANDMARK is step index (int)
+    # current_idx for KEYLOG could be float (time offset) or int (event index)?
+    # Let's store it as is, caller handles meaning.
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     state = json.dumps({"route_id": route_id, "current_idx": current_idx})
