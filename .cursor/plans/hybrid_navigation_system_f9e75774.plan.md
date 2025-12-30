@@ -543,5 +543,3 @@ If ORB landmark improvements + minimap validation still don't provide sufficient
 - Provides coarse "am I lost?" check
 - Low complexity (reuse ORB infrastructure)
 - Optional feature, not critical path
-
-**Phase 5** (Validation): Test on real routes

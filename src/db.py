@@ -58,6 +58,18 @@ def init_db():
         FOREIGN KEY (route_id) REFERENCES routes (id)
     )''')
     
+    # Hybrid Nodes table
+    c.execute('''CREATE TABLE IF NOT EXISTS hybrid_nodes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        route_id INTEGER,
+        node_order INTEGER,
+        timestamp REAL,
+        minimap_path TEXT,
+        main_view_path TEXT,
+        input_intent TEXT, -- JSON list of keys
+        FOREIGN KEY (route_id) REFERENCES routes (id)
+    )''')
+
     # Active Route state table
     c.execute('''CREATE TABLE IF NOT EXISTS active_state (
         key TEXT PRIMARY KEY,
@@ -105,6 +117,13 @@ def save_route(name, data, route_type="LANDMARK"):
                 c.execute("INSERT INTO keylog_events (route_id, event_order, time_offset, event_type, key_char) VALUES (?, ?, ?, ?, ?)",
                           (route_id, i, event['time_offset'], event['event_type'], event['key']))
         
+        elif route_type == "HYBRID":
+            nodes = data
+            for i, node in enumerate(nodes):
+                intent_json = json.dumps(node.get('input_intent', []))
+                c.execute("INSERT INTO hybrid_nodes (route_id, node_order, timestamp, minimap_path, main_view_path, input_intent) VALUES (?, ?, ?, ?, ?, ?)",
+                          (route_id, i, node['timestamp'], node['minimap_path'], node['main_view_path'], intent_json))
+
         conn.commit()
         return True
     except sqlite3.IntegrityError as e:
@@ -202,6 +221,19 @@ def load_route(route_id):
         rows = c.fetchall()
         events = [{"time_offset": r[0], "event_type": r[1], "key": r[2]} for r in rows]
         result["events"] = events
+
+    elif route_type == "HYBRID":
+        c.execute("SELECT timestamp, minimap_path, main_view_path, input_intent FROM hybrid_nodes WHERE route_id = ? ORDER BY node_order ASC", (route_id,))
+        rows = c.fetchall()
+        nodes = []
+        for r in rows:
+            nodes.append({
+                "timestamp": r[0],
+                "minimap_path": r[1],
+                "main_view_path": r[2],
+                "input_intent": json.loads(r[3]) if r[3] else []
+            })
+        result["nodes"] = nodes
 
     conn.close()
     return result

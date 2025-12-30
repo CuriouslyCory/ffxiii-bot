@@ -4,7 +4,7 @@ overview: Implement a robust hybrid navigation system using ORB feature matching
 todos:
   - id: vision-orb
     content: Upgrade VisionEngine with ORB feature matching capabilities
-    status: pending
+    status: completed
   - id: minimap-odometry
     content: Implement Minimap Drift Calculator (Visual Odometry)
     status: pending
@@ -87,15 +87,12 @@ Update `MovementState` to use a **Steering Behavior**.
 1.  Update `MovementState` recording logic to save "Route Nodes".
 2.  Data Structure:
     ```json
-                        {
-                          "timestamp": 12345,
-                          "minimap_image": "node_1_mm.png",
-                          "main_image": "node_1_main.png",
-                          "inputs": ["w"] 
-                        }
+                                    {
+                                      "timestamp": 12345,
+                                      "minimap_image": "node_1_mm.png",
+                                      "main_image": "node_1_main.png",
+                                      "inputs": ["w"] 
+                                    }
+        
+    
     ```
-
-
-
-
-### Phase 4: Path Follower (Playback)

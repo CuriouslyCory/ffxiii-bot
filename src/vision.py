@@ -1,7 +1,75 @@
 import cv2
 import numpy as np
 import mss
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
+
+class FeatureMatcher:
+    """
+    Handles feature detection, description, and matching using ORB.
+    Provides homography calculation for visual odometry.
+    """
+    def __init__(self):
+        # Initialize ORB detector
+        self.orb = cv2.ORB_create(nfeatures=2000)
+        # Initialize Brute-Force Matcher with Hamming distance (better for ORB)
+        self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+
+    def detect_and_compute(self, image: np.ndarray, mask: Optional[np.ndarray] = None):
+        """
+        Detects keypoints and computes descriptors for the given image.
+        """
+        return self.orb.detectAndCompute(image, mask)
+
+    def match_features(self, des1, des2, ratio_thresh=0.75) -> List[cv2.DMatch]:
+        """
+        Matches descriptors using KNN and applies Lowe's ratio test.
+        """
+        if des1 is None or des2 is None or len(des1) < 2 or len(des2) < 2:
+            return []
+            
+        matches = self.bf.knnMatch(des1, des2, k=2)
+        
+        good_matches = []
+        for m, n in matches:
+            if m.distance < ratio_thresh * n.distance:
+                good_matches.append(m)
+                
+        return good_matches
+
+    def compute_homography(self, kp1, kp2, good_matches, min_match_count=10):
+        """
+        Computes the Homography matrix if enough matches are found.
+        Returns (Matrix, Mask)
+        """
+        if len(good_matches) < min_match_count:
+            return None, None
+            
+        src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+        dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+        
+        # RANSAC to filter outliers
+        M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        return M, mask
+
+    def decompose_homography(self, M):
+        """
+        Decomposes the homography matrix to extract translation (dx, dy) and rotation (angle).
+        Assumes the transformation is mostly 2D rotation and translation (affine-like).
+        """
+        if M is None:
+            return 0.0, 0.0, 0.0
+            
+        # Extract translation
+        dx = M[0, 2]
+        dy = M[1, 2]
+        
+        # Extract rotation angle (approximate from top-left 2x2)
+        # M = [[cos(a), -sin(a), dx], [sin(a), cos(a), dy], [0, 0, 1]]
+        # atan2(sin(a), cos(a)) -> atan2(M[1,0], M[0,0])
+        angle_rad = np.arctan2(M[1, 0], M[0, 0])
+        angle_deg = np.degrees(angle_rad)
+        
+        return dx, dy, angle_deg
 
 class VisionEngine:
     """
@@ -9,6 +77,7 @@ class VisionEngine:
     
     It supports defining Regions of Interest (ROIs) to optimize matching performance
     and provides fuzzy matching capabilities using OpenCV's matchTemplate.
+    Now includes Feature Matching (ORB) for visual odometry.
     """
     
     def __init__(self, window_offset: Tuple[int, int] = (0, 0), resolution: Tuple[int, int] = (1920, 1080)):
@@ -23,6 +92,9 @@ class VisionEngine:
         self.sct = mss.mss()
         self.update_monitor()
         self.templates: Dict[str, np.ndarray] = {}
+        
+        # Initialize Feature Matcher
+        self.feature_matcher = FeatureMatcher()
 
     def update_monitor(self):
         """Updates the monitor configuration for mss based on window_offset and resolution."""
@@ -140,4 +212,3 @@ class VisionEngine:
         cv2.rectangle(image, (x, y), (x + w, y + h), color, 2)
         label = f"{template_name} ({conf:.2f})"
         cv2.putText(image, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-
