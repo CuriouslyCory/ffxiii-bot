@@ -3,7 +3,7 @@
 ## Overview
 
 The Route Mapping system allows the FFXIII bot to navigate the open world autonomously. The system supports three navigation methods:
-1.  **Hybrid Visual Odometry (Recommended)**: Advanced navigation using the minimap as a high-frequency visual reference.
+1.  **Hybrid Visual Odometry (Recommended)**: Advanced navigation using the minimap as a high-frequency visual reference. Generates a composite "Master Map" artifact upon saving.
 2.  **Landmark Routing**: Visual navigation using template matching to recognize specific environment features.
 3.  **Keylog Routing**: Time-based replay of user inputs (movement and camera).
 
@@ -16,6 +16,7 @@ HVO is the most robust navigation method. It records "breadcrumbs" (nodes) every
 -   **Control Logic**: Prioritizes camera rotation to align with the target node's orientation before moving forward at high speed.
 -   **Stability**: Uses Exponential Moving Averages (EMA) and circular averaging for smooth movement and to prevent overshoot.
 -   **Arrival Check**: Uses a rolling buffer to average drift values, ensuring the bot truly reaches a node before advancing (default: <20px dist, <15° angle).
+-   **Master Map Generation**: Upon finishing a recording, the system stitches all minimap nodes into a single composite PNG with a breadcrumb trail showing the recorded path. This artifact is stored in the database for route preview and debugging.
 
 ### 2. Visual Landmarks (Landmark Routing)
 A "node" in a path is a 150x150 pixel image of a distinct object or texture in the game world. The bot navigates by finding these targets on screen, centering them, and moving forward.
@@ -98,3 +99,12 @@ Routes are stored in `data/routes.db`.
 | **`2,4,6,8`** | REC (Keylog) | Move Camera (Numpad) |
 | **`[` / `]`** | MANAGING | Prev/Next Step (Landmark Only) |
 | **`,` / `.`** | MANAGING | Prev/Next Image (Landmark Only) |
+
+## Maintenance & Utilities
+
+### Cleanup Utility
+To reset the system (delete all recorded routes and clear all landmark images), run:
+```bash
+python cleanup.py
+```
+This will prompt for confirmation before truncating the database and deleting image artifacts.

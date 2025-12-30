@@ -18,6 +18,7 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT UNIQUE NOT NULL,
         type TEXT DEFAULT 'LANDMARK', 
+        master_map_path TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
     
@@ -27,6 +28,13 @@ def init_db():
     except sqlite3.OperationalError:
         print("Migrating routes table: Adding 'type' column.")
         c.execute("ALTER TABLE routes ADD COLUMN type TEXT DEFAULT 'LANDMARK'")
+
+    # Check if 'master_map_path' column exists (for migration)
+    try:
+        c.execute("SELECT master_map_path FROM routes LIMIT 1")
+    except sqlite3.OperationalError:
+        print("Migrating routes table: Adding 'master_map_path' column.")
+        c.execute("ALTER TABLE routes ADD COLUMN master_map_path TEXT")
 
     # Steps table (ordered steps in a route)
     c.execute('''CREATE TABLE IF NOT EXISTS route_steps (
@@ -67,8 +75,16 @@ def init_db():
         minimap_path TEXT,
         main_view_path TEXT,
         input_intent TEXT, -- JSON list of keys
+        relative_offset TEXT, -- JSON dict {dx, dy, angle}
         FOREIGN KEY (route_id) REFERENCES routes (id)
     )''')
+
+    # Check if 'relative_offset' column exists (for migration)
+    try:
+        c.execute("SELECT relative_offset FROM hybrid_nodes LIMIT 1")
+    except sqlite3.OperationalError:
+        print("Migrating hybrid_nodes table: Adding 'relative_offset' column.")
+        c.execute("ALTER TABLE hybrid_nodes ADD COLUMN relative_offset TEXT")
 
     # Active Route state table
     c.execute('''CREATE TABLE IF NOT EXISTS active_state (
@@ -79,7 +95,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-def save_route(name, data, route_type="LANDMARK"):
+def save_route(name, data, route_type="LANDMARK", master_map_path=None):
     """
     Saves a route to the database.
     
@@ -90,11 +106,15 @@ def save_route(name, data, route_type="LANDMARK"):
     If route_type is "KEYLOG":
         data: list of dicts (events).
         Each dict: {'time_offset': float, 'event_type': str, 'key': str}
+
+    If route_type is "HYBRID":
+        data: list of dicts (nodes).
+        Each dict: {'timestamp': float, 'minimap_path': str, 'main_view_path': str, 'input_intent': list, 'relative_offset': dict}
     """
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     try:
-        c.execute("INSERT INTO routes (name, type) VALUES (?, ?)", (name, route_type))
+        c.execute("INSERT INTO routes (name, type, master_map_path) VALUES (?, ?, ?)", (name, route_type, master_map_path))
         route_id = c.lastrowid
         
         if route_type == "LANDMARK":
@@ -121,8 +141,9 @@ def save_route(name, data, route_type="LANDMARK"):
             nodes = data
             for i, node in enumerate(nodes):
                 intent_json = json.dumps(node.get('input_intent', []))
-                c.execute("INSERT INTO hybrid_nodes (route_id, node_order, timestamp, minimap_path, main_view_path, input_intent) VALUES (?, ?, ?, ?, ?, ?)",
-                          (route_id, i, node['timestamp'], node['minimap_path'], node['main_view_path'], intent_json))
+                offset_json = json.dumps(node.get('relative_offset')) if node.get('relative_offset') else None
+                c.execute("INSERT INTO hybrid_nodes (route_id, node_order, timestamp, minimap_path, main_view_path, input_intent, relative_offset) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                          (route_id, i, node['timestamp'], node['minimap_path'], node['main_view_path'], intent_json, offset_json))
 
         conn.commit()
         return True
@@ -186,15 +207,17 @@ def load_route(route_id):
     c = conn.cursor()
     
     # Get Route
-    c.execute("SELECT name, type FROM routes WHERE id = ?", (route_id,))
+    c.execute("SELECT name, type, master_map_path FROM routes WHERE id = ?", (route_id,))
     res = c.fetchone()
     if not res: return None
     route_name = res[0]
     route_type = res[1] if res[1] else "LANDMARK"
+    master_map_path = res[2]
     
-    result = {"id": route_id, "name": route_name, "type": route_type}
+    result = {"id": route_id, "name": route_name, "type": route_type, "master_map_path": master_map_path}
     
     if route_type == "LANDMARK":
+        # ... (unchanged)
         # Get Steps
         c.execute("SELECT id, step_order, name FROM route_steps WHERE route_id = ? ORDER BY step_order ASC", (route_id,))
         step_rows = c.fetchall()
@@ -223,7 +246,7 @@ def load_route(route_id):
         result["events"] = events
 
     elif route_type == "HYBRID":
-        c.execute("SELECT timestamp, minimap_path, main_view_path, input_intent FROM hybrid_nodes WHERE route_id = ? ORDER BY node_order ASC", (route_id,))
+        c.execute("SELECT timestamp, minimap_path, main_view_path, input_intent, relative_offset FROM hybrid_nodes WHERE route_id = ? ORDER BY node_order ASC", (route_id,))
         rows = c.fetchall()
         nodes = []
         for r in rows:
@@ -231,7 +254,8 @@ def load_route(route_id):
                 "timestamp": r[0],
                 "minimap_path": r[1],
                 "main_view_path": r[2],
-                "input_intent": json.loads(r[3]) if r[3] else []
+                "input_intent": json.loads(r[3]) if r[3] else [],
+                "relative_offset": json.loads(r[4]) if r[4] else None
             })
         result["nodes"] = nodes
 
@@ -285,3 +309,26 @@ def clear_active_route():
     c.execute("DELETE FROM active_state WHERE key = 'current_route'")
     conn.commit()
     conn.close()
+
+def truncate_db():
+    """
+    Deletes all data from all tables in the database.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    tables = ['routes', 'route_steps', 'step_images', 'keylog_events', 'hybrid_nodes', 'active_state']
+    for table in tables:
+        try:
+            c.execute(f"DELETE FROM {table}")
+        except sqlite3.OperationalError as e:
+            print(f"[DB] Table {table} does not exist or could not be cleared: {e}")
+    
+    # Reset autoincrement sequences
+    try:
+        c.execute("DELETE FROM sqlite_sequence")
+    except sqlite3.OperationalError:
+        pass
+        
+    conn.commit()
+    conn.close()
+    print("[DB] Database truncated successfully.")

@@ -18,6 +18,47 @@ class MovementState(State):
     
     def __init__(self, manager):
         super().__init__(manager)
+        
+        # ============================================================================
+        # CONFIGURATION PARAMETERS
+        # All magic numbers and tunable parameters are defined here for easy adjustment
+        # ============================================================================
+        
+        # --- Hybrid Recording ---
+        self.HYBRID_NODE_SAMPLE_INTERVAL = 0.5  # seconds
+        
+        # --- Hybrid Playback Control ---
+        self.SMOOTHING_ALPHA = 0.25
+        self.CAMERA_ROTATION_KP = 0.03
+        self.CAMERA_ROTATION_MAX = 0.4
+        self.CAMERA_ROTATION_MIN_THRESHOLD = 0.05
+        self.CAMERA_ROTATION_MIN_BOOST = 0.2
+        self.STRAFE_KP = 0.01
+        self.STRAFE_MAX = 0.25
+        self.APPROACH_SLOWDOWN_DISTANCE = 40
+        self.APPROACH_SLOWDOWN_MIN = 0.25
+        
+        # --- Coasting/Recovery ---
+        self.COAST_DURATION = 1.5
+        self.COAST_DURATION_EXTENDED = 2.0  # When turning
+        self.COAST_TURNING_THRESHOLD = 0.3
+        self.COAST_FORWARD_THRESHOLD = 0.2
+        self.RETRY_DURATION = 1.0
+        self.RETRY_ATTEMPTS = 3
+        self.RETRY_SCALE_START = 0.8
+        self.RETRY_SCALE_DECREMENT = 0.2
+        self.RETRY_SCALE_MIN = 0.2
+        
+        # --- Lookahead ---
+        self.LOOKAHEAD_DEPTH = 3
+        
+        # --- Phase Correlation Threshold (shared with navigator) ---
+        self.PHASE_CORR_CONFIDENCE_THRESHOLD = 0.05
+        
+        # ============================================================================
+        # RUNTIME STATE
+        # ============================================================================
+        
         self.mode = "IDLE"
         self.landmarks = [] # Now a list of steps: [{'name': 'Step_X', 'images': [{'filename': '...', 'name': '...'}]}]
         self.current_landmark_idx = 0 # Step index
@@ -32,6 +73,7 @@ class MovementState(State):
         self.current_recording_step_images = [] # List of images for the current step being recorded
         self.recording_nodes = [] # List of Hybrid nodes
         self.last_node_time = 0
+        self.last_recorded_minimap = None # Image for relative offset tracking
         self.arrival_buffer = []  # Rolling window for arrival EMA
         
         # Playback/Seek state
@@ -58,6 +100,7 @@ class MovementState(State):
         self.req_select_route = None # Stores integer key (1-9)
         self.req_stop = False # Escape key to stop
         self.req_playback_action = None # For '2', '3' actions during playback
+        self.req_toggle_hsv_debug = False # 'd' key to toggle HSV debug mode
         
         # Ensure landmark directory exists
         os.makedirs(LANDMARK_DIR, exist_ok=True)
@@ -118,6 +161,7 @@ class MovementState(State):
         print("  'r': Start New Recording (will prompt for type)")
         print("  'p': Playback Route (List/Select)")
         print("  'u': Resume Current Loaded Route")
+        print("  'd': Toggle HSV Filter Debug Mode (during playback)")
         print("  'ESC': Stop Playback/Recording")
         
         if self.mode == "RECORDING":
@@ -134,6 +178,11 @@ class MovementState(State):
         except: pass
         try: cv2.destroyWindow(self.navigator.debug_window_name)
         except: pass
+        try: cv2.destroyWindow(self.navigator.hsv_debug_window_name)
+        except: pass
+        # Disable HSV debug if active
+        if self.navigator.hsv_debug_enabled:
+            self.navigator.disable_hsv_debug()
         
         if self.mode == "PLAYBACK" and self.current_route_id:
              set_active_route(self.current_route_id, self.current_landmark_idx)
@@ -164,6 +213,7 @@ class MovementState(State):
                 elif k == 'y': self.req_save_exit = True
                 elif k == 'u': self.req_playback = True
                 elif k == 'p': self.req_list_routes = True
+                elif k == 'd': self.req_toggle_hsv_debug = True  # Toggle HSV debug mode
                 elif k in [str(i) for i in range(1, 10)]: 
                     self.req_select_route = int(k)
                 elif k == '2': self.req_playback_action = 'delete_current_image'
@@ -206,6 +256,14 @@ class MovementState(State):
                         next_idx = (self.current_landmark_idx + 1) % len(self.landmarks)
                         self.delete_image_from_step(next_idx)
 
+        # Handle HSV Debug Toggle
+        if self.req_toggle_hsv_debug:
+            self.req_toggle_hsv_debug = False
+            if self.navigator.hsv_debug_enabled:
+                self.navigator.disable_hsv_debug()
+            else:
+                self.navigator.enable_hsv_debug()
+        
         if self.req_playback:
             self.req_playback = False
             self.start_playback()
@@ -296,6 +354,7 @@ class MovementState(State):
         if r_type == "HYBRID":
             self.recording_nodes = []
             self.last_node_time = time.time()
+            self.last_recorded_minimap = None
             print("\n[RECORDING HYBRID] Started.")
             print("  Move naturally. Breadcrumbs are collected automatically.")
             print("  'y': Finish recording.")
@@ -319,6 +378,20 @@ class MovementState(State):
         try: cv2.destroyWindow(self.navigator.debug_window_name)
         except: pass
         
+        # Generate Master Map for Hybrid routes
+        master_map_path = None
+        if self.route_type == "HYBRID" and self.recording_nodes:
+            print("[MASTER MAP] Generating composite route map...")
+            master_map = self.navigator.generate_master_map(self.recording_nodes, LANDMARK_DIR)
+            if master_map is not None:
+                timestamp = int(time.time())
+                filename = f"master_map_{timestamp}.png"
+                master_map_path = os.path.join(LANDMARK_DIR, filename)
+                cv2.imwrite(master_map_path, master_map)
+                print(f"[MASTER MAP] Saved composite map to {master_map_path}")
+            else:
+                print("[MASTER MAP] Failed to generate composite map.")
+
         self.blocking_input = True
         print("\n[INPUT REQUIRED] Enter name for this route:")
         try:
@@ -327,7 +400,7 @@ class MovementState(State):
              
              data_to_save = self.recording_nodes if self.route_type == "HYBRID" else self.landmarks
              
-             if save_route(name, data_to_save, self.route_type):
+             if save_route(name, data_to_save, self.route_type, master_map_path=master_map_path):
                  print(f"[SAVED] Route '{name}' saved to database.")
              else:
                  print("[ERROR] Failed to save route.")
@@ -340,9 +413,13 @@ class MovementState(State):
     # --- Hybrid Logic ---
 
     def handle_hybrid_recording(self, image):
+        """
+        Handles hybrid recording by sampling nodes at regular intervals.
+        NOTE: Images are saved stretched (400x520) - this is the only transformation applied.
+        """
         current_time = time.time()
-        # Sample every 0.5 seconds (Frequency doubled from 1.0)
-        if current_time - self.last_node_time >= 0.5:
+        # Sample at configured interval
+        if current_time - self.last_node_time >= self.HYBRID_NODE_SAMPLE_INTERVAL:
             self.record_hybrid_node(image)
             self.last_node_time = current_time
 
@@ -356,21 +433,50 @@ class MovementState(State):
         mm_path = os.path.join(LANDMARK_DIR, mm_filename)
         
         # Save the UNMASKED minimap ROI so we can feature match against it later
-        # Use get_minimap_crop to ensure calibration
+        # Use get_minimap_crop to ensure calibration and stretching to 400x520
+        # NOTE: Images are always saved stretched (400x520) - this is the only transformation
         roi_img = self.navigator.get_minimap_crop(image)
         if roi_img is not None:
              cv2.imwrite(mm_path, roi_img)
         else:
              print(f"[REC HYBRID] Failed to extract minimap for node {len(self.recording_nodes)}")
+             return
         
+        # 1. Absolute Orientation (Compass)
+        curr_arrow_angle, curr_pivot = self.navigator.get_gold_arrow_angle(roi_img)
+        
+        # 2. Translation Odometry (World Space)
+        world_offset = None
+        if self.last_recorded_minimap is not None:
+            # Use Phase Correlation on North-Aligned images
+            # Aligns around true pivots to eliminate swing drift
+            prev_arrow_angle = self.recording_nodes[-1].get('arrow_angle', 0.0)
+            # Default pivot is the stretched center (from navigator config)
+            default_pivot = (self.navigator.MINIMAP_CENTER_STRETCHED_X, self.navigator.MINIMAP_CENTER_STRETCHED_Y)
+            prev_pivot = self.recording_nodes[-1].get('arrow_pivot', default_pivot)  # Stretched space
+            
+            dx, dy, conf = self.navigator.compute_drift_pc(roi_img, self.last_recorded_minimap, 
+                                                           curr_arrow_angle, curr_pivot,
+                                                           prev_arrow_angle, prev_pivot)
+            
+            if conf > self.PHASE_CORR_CONFIDENCE_THRESHOLD:
+                world_offset = {"dx": dx, "dy": dy, "conf": conf}
+                print(f"[REC HYBRID] Node {len(self.recording_nodes)} | World Offset: dx={dx:.1f}, dy={dy:.1f} | Arrow: {curr_arrow_angle:.1f}")
+            else:
+                print(f"[REC HYBRID] Low confidence World Offset (conf: {conf:.2f}). Skipping.")
+
         node = {
             "id": len(self.recording_nodes),
             "timestamp": timestamp,
             "minimap_path": mm_filename,
             "main_view_path": None, # Optional for now
-            "inputs": [] 
+            "inputs": [],
+            "relative_offset": world_offset,
+            "arrow_angle": curr_arrow_angle,
+            "arrow_pivot": curr_pivot
         }
         self.recording_nodes.append(node)
+        self.last_recorded_minimap = roi_img
         print(f"[REC HYBRID] Saved Node {node['id']}")
 
     def get_minimap_image(self, node):
@@ -408,7 +514,7 @@ class MovementState(State):
         # User requirement: "next node must be reached within a reasonable error margin before the system starts moving towards the next node."
         
         candidates = []
-        lookahead = 3
+        lookahead = self.LOOKAHEAD_DEPTH
         
         # 1. Evaluate Current Node First
         current_node = self.landmarks[self.current_landmark_idx]
@@ -421,13 +527,13 @@ class MovementState(State):
         if current_mm is not None:
             res = self.navigator.compute_drift(image, current_mm)
             if res:
-                dx, dy, angle, inliers = res
+                dx, dy, angle, inliers, _ = res
                 drift = (dx, dy, angle)
 
                 # Maintain arrival rolling window (EMA-style simple buffer)
-                if inliers >= 8:
+                if inliers >= self.navigator.MIN_INLIERS_FOR_TRACKING:
                     self.arrival_buffer.append((dx, dy, angle))
-                    if len(self.arrival_buffer) > 5:
+                    if len(self.arrival_buffer) > self.navigator.ARRIVAL_BUFFER_SIZE:
                         self.arrival_buffer.pop(0)
                 else:
                     # Do not add low-confidence readings
@@ -440,7 +546,7 @@ class MovementState(State):
                 if self.arrival_buffer:
                     n = len(self.arrival_buffer)
                     mean_dx = sum(v[0] for v in self.arrival_buffer) / n
-                    mean_dy = abs(sum(v[1] for v in self.arrival_buffer) / n)
+                    mean_dy = sum(v[1] for v in self.arrival_buffer) / n
                     # Circular mean for angle
                     s_sin = sum(np.sin(np.radians(v[2])) for v in self.arrival_buffer) / n
                     s_cos = sum(np.cos(np.radians(v[2])) for v in self.arrival_buffer) / n
@@ -449,7 +555,7 @@ class MovementState(State):
                 # ARRIVAL CHECK (Strict-ish)
                 dist = np.sqrt(mean_dx*mean_dx + mean_dy*mean_dy)
                 # Thresholds (tunable): slightly lenient on angle to avoid jitter misses
-                if abs(dist) < 20 and abs(mean_angle) < 15:
+                if abs(dist) < self.navigator.ARRIVAL_DISTANCE_THRESHOLD and abs(mean_angle) < self.navigator.ARRIVAL_ANGLE_THRESHOLD:
                     print(f"[PLAYBACK] Reached Node {self.current_landmark_idx} (Dist: {dist:.1f}, Ang: {mean_angle:.1f})")
                     self.current_landmark_idx += 1
                     self.arrival_buffer = []  # reset buffer for next node
@@ -461,8 +567,7 @@ class MovementState(State):
                 self._approach_dist = dist
                 
                 # If current node tracking is good, we stay here.
-                MIN_INLIERS = 8
-                if inliers >= MIN_INLIERS:
+                if inliers >= self.navigator.MIN_INLIERS_FOR_TRACKING:
                     # valid tracking, maintain current target
                     pass
                 else:
@@ -484,8 +589,8 @@ class MovementState(State):
                     best = None
                     for c in candidates:
                         # Prioritize High Inliers
-                        # Increased threshold for recovery jump from 12 to 15 to prevent false positives
-                        if c['res'][3] > 15: # Strong match
+                        # Increased threshold for recovery jump to prevent false positives
+                        if c['res'][3] > self.navigator.MIN_INLIERS_FOR_RECOVERY:  # Strong match
                             if best is None or c['res'][3] > best['res'][3]:
                                 best = c
                     
@@ -511,7 +616,7 @@ class MovementState(State):
              time_since_last_seen = current_time - self.last_seen_time
              
              # Coasting duration (hold last input)
-             coast_duration = 0.5
+             coast_duration = self.COAST_DURATION
              
              # Retrieve last valid controls (or current if none stored)
              last_ctrl = getattr(self, 'last_valid_controls', self.controller.state)
@@ -520,10 +625,10 @@ class MovementState(State):
              last_ry = last_ctrl.get('ry', 0.0)
              
              # Extended coast if we were turning
-             if abs(last_rx) > 0.3 and abs(last_ly) < 0.2:
-                 coast_duration = 2.0 
+             if abs(last_rx) > self.COAST_TURNING_THRESHOLD and abs(last_ly) < self.COAST_FORWARD_THRESHOLD:
+                 coast_duration = self.COAST_DURATION_EXTENDED
              
-             retry_duration = 1.0 # Duration of each retry attempt
+             retry_duration = self.RETRY_DURATION  # Duration of each retry attempt
              
              if time_since_last_seen < coast_duration:
                  # Phase 1: Reverse Rotation, Hold Forward
@@ -542,15 +647,17 @@ class MovementState(State):
                  self.controller.move_character(last_lx, last_ly)
                  
                  self.navigator.show_debug_view(image, target_mm, self.controller.state, tracking_active=False, status_msg="REVERSING")
+                 if self.navigator.hsv_debug_enabled:
+                     self.navigator.show_hsv_debug(image)
                  return
                  
-             elif time_since_last_seen < coast_duration + retry_duration * 3:
+             elif time_since_last_seen < coast_duration + retry_duration * self.RETRY_ATTEMPTS:
                  # Phase 2: Recovery / Retry (Slower Spin)
                  retry_time = time_since_last_seen - coast_duration
-                 attempt = int(retry_time // retry_duration) + 1 # 1, 2, 3
+                 attempt = int(retry_time // retry_duration) + 1  # 1, 2, 3
                  
-                 # Slow down factor: 0.6, 0.4, 0.2
-                 scale = max(0.2, 0.8 - (0.2 * attempt))
+                 # Slow down factor: progressively slower
+                 scale = max(self.RETRY_SCALE_MIN, self.RETRY_SCALE_START - (self.RETRY_SCALE_DECREMENT * attempt))
                  
                  # Apply scaled controls based on LAST VALID inputs
                  cam_x = last_rx * scale
@@ -561,16 +668,20 @@ class MovementState(State):
                  self.controller.move_camera(cam_x, cam_y)
                  
                  self.navigator.show_debug_view(image, target_mm, self.controller.state, tracking_active=False, status_msg=f"RETRY {attempt}")
+                 if self.navigator.hsv_debug_enabled:
+                     self.navigator.show_hsv_debug(image)
                  return
                  
              else:
                  # Phase 3: Give Up
-                 if time_since_last_seen < (coast_duration + retry_duration * 3 + 0.5):
+                 if time_since_last_seen < (coast_duration + retry_duration * self.RETRY_ATTEMPTS + 0.5):
                      print(f"[PLAYBACK] Lost visual tracking for {time_since_last_seen:.2f}s. Stopping.")
                      
                  self.controller.move_character(0, 0)
                  self.controller.move_camera(0, 0)
                  self.navigator.show_debug_view(image, target_mm, self.controller.state, tracking_active=False, status_msg="LOST")
+                 if self.navigator.hsv_debug_enabled:
+                     self.navigator.show_hsv_debug(image)
                  return
 
         # Drift is valid
@@ -582,9 +693,8 @@ class MovementState(State):
         if not hasattr(self, '_smoothed_drift'):
             self._smoothed_drift = {'dx': dx, 'dy': dy, 'angle': angle}
             
-        # Increased alpha from 0.3 to 0.6 to reduce lag/overshoot
-        # Higher alpha = more responsive, less smooth. Lower alpha = smoother, more lag.
-        alpha = 0.75 
+        # EMA smoothing: Higher alpha = more responsive, less smooth. Lower alpha = smoother, more lag.
+        alpha = self.SMOOTHING_ALPHA 
         
         self._smoothed_drift['dx'] = alpha * dx + (1 - alpha) * self._smoothed_drift['dx']
         self._smoothed_drift['dy'] = alpha * dy + (1 - alpha) * self._smoothed_drift['dy']
@@ -642,51 +752,21 @@ class MovementState(State):
         # Let's try INVERTING the control logic again to see if it fixes the "always turns right" issue.
         # If `sangle` > 0 means "Need to turn Right", then `cam_x` should be > 0.
         
-        cam_x = 0.0
-        kp_rot = 0.03 
+        # Camera Control: Proportional control to correct angle error
+        # Positive angle means current is rotated CW relative to target
+        # To correct, we rotate CCW (camera left = negative X)
+        # Using positive feedback here (sangle * kp) - may need inversion based on testing
+        cam_x = sangle * self.CAMERA_ROTATION_KP
         
-        # Trying inverted logic from previous step:
-        # cam_x = sangle * kp_rot
-        
-        # Wait, I previously wrote: "New: cam_x = sangle * kp_rot".
-        # If I revert to negative feedback: `cam_x = -sangle * kp_rot`.
-        # Let's try the POSITIVE feedback loop first, assuming the decompose angle is "Error to be applied".
-        
-        # Actually, let's look at the debug overlay in your screenshot.
-        # "ang: 36.51". The view looks rotated to the LEFT compared to target? 
-        # No, the Minimap on Right (Current) has the cone pointing UP-RIGHT. 
-        # Minimap on Left (Target) has cone pointing UP.
-        # So Current is rotated CW (Right) relative to Target.
-        # Angle is +36.51.
-        # So Positive Angle = CW Rotation.
-        # To fix CW rotation, we need to rotate CCW (Left).
-        # Camera Left is X < 0.
-        # So if Angle > 0, we want X < 0.
-        # So `cam_x = -angle * kp` is correct.
-        
-        # BUT, user says it "always turns to the right".
-        # This means we are sending X > 0.
-        # If Angle is +36 (CW), and we send X > 0 (Right/CW), we are making it worse!
-        # So `cam_x = angle * kp` (Positive feedback) causes runaway Right turn if angle is positive.
-        # Wait, my previous code was `cam_x = sangle * kp_rot` (Positive).
-        # Ah, I changed it to positive in the last turn? No, I tried to.
-        # The file content shows: `cam_x = sangle * kp_rot` (Line 493).
-        # So the code WAS using positive feedback, which explains "always turns right" if angle is positive.
-        
-        # User requested inversion: "actively steers away from 0" implies current logic is positive feedback.
-        # So we switch sign to stabilize.
-        cam_x = sangle * kp_rot
-        
-        # Reduced max speed further to preventing flying past target
-        cam_x = max(-0.4, min(0.4, cam_x)) 
+        # Clamp to max speed to prevent flying past target
+        cam_x = max(-self.CAMERA_ROTATION_MAX, min(self.CAMERA_ROTATION_MAX, cam_x)) 
 
-        # Min speed boost
-        # If absolute value is too small but not zero, boost it to overcome friction?
-        if abs(cam_x) < 0.05:
+        # Min speed boost: If absolute value is too small but not zero, boost it to overcome friction
+        if abs(cam_x) < self.CAMERA_ROTATION_MIN_THRESHOLD:
              cam_x = 0.0
-        elif abs(cam_x) < 0.2:
+        elif abs(cam_x) < self.CAMERA_ROTATION_MIN_BOOST:
              # Boost small values to minimum movement threshold
-             cam_x = 0.2 if cam_x > 0 else -0.2
+             cam_x = self.CAMERA_ROTATION_MIN_BOOST if cam_x > 0 else -self.CAMERA_ROTATION_MIN_BOOST
             
         self.controller.move_camera(cam_x, 0)
         
@@ -697,16 +777,17 @@ class MovementState(State):
         move_x = 0.0
         move_y = 0.0
         
-        if abs(sangle) < 20.0: # Allow movement while still correcting
+        if abs(sangle) < 180.0: # Allow movement while still correcting
             # Forward Speed (y)
             # Always drive the stick fully forward when reasonably aligned to force run speed.
             # If you want softer approach, scale move_y by alignment instead.
-            move_y = 1.0
+            move_y = -1.0 * (sdy / abs(sdy))
+            print(f"[DEBUG] move_y: {move_y}")
 
             # Slow down as we get very close to the node to avoid flying past without triggering
             approach_dist = getattr(self, "_approach_dist", None)
-            if approach_dist is not None and approach_dist < 60:
-                slowdown = max(0.25, approach_dist / 60.0)
+            if approach_dist is not None and approach_dist < self.APPROACH_SLOWDOWN_DISTANCE:
+                slowdown = max(self.APPROACH_SLOWDOWN_MIN, approach_dist / self.APPROACH_SLOWDOWN_DISTANCE)
                 move_y *= slowdown
 
             # Optional: if you want some strafe correction, keep it but cap magnitude.
@@ -715,9 +796,8 @@ class MovementState(State):
             # But we might need to strafe if dx is large.
             # +dx means we are shifted right? -> Strafe Left?
             # Let's add slight strafe correction if needed.
-            kp_strafe = 0.01 # Reduced from 0.01 to reduce "hard strafing"
-            move_x = sdx * kp_strafe
-            move_x = max(-0.25, min(0.25, move_x)) # Cap strafe
+            move_x = sdx * self.STRAFE_KP
+            move_x = max(self.STRAFE_MAX, min(self.STRAFE_MAX, move_x))  # Cap strafe
             
         else:
             # Angle too large, stop moving and just rotate
@@ -727,6 +807,10 @@ class MovementState(State):
         self.controller.move_character(move_x, move_y)
         
         self.navigator.show_debug_view(image, target_mm, self.controller.state, tracking_active=True)
+        
+        # Show HSV debug window if enabled
+        if self.navigator.hsv_debug_enabled:
+            self.navigator.show_hsv_debug(image)
         
         # Store valid controls for coasting/recovery reference
         self.last_valid_controls = self.controller.state.copy()

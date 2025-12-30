@@ -210,7 +210,7 @@ class Controller:
         # Left Stick Y: -1.0 is Up (Forward), 1.0 is Down (Backward)
         # User requested: 1.0 is Forward, -1.0 is Backward
         
-        gamepad_y = -y 
+        gamepad_y = y 
         
         # print(f"[DEBUG CTRL] Move Char: x={x:.2f}, y={y:.2f} -> gamepad_x={x:.2f}, gamepad_y={gamepad_y:.2f}")
         
