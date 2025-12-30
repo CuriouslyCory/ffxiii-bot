@@ -32,6 +32,7 @@ class MovementState(State):
         self.current_recording_step_images = [] # List of images for the current step being recorded
         self.recording_nodes = [] # List of Hybrid nodes
         self.last_node_time = 0
+        self.arrival_buffer = []  # Rolling window for arrival EMA
         
         # Playback/Seek state
         self.last_seen_time = 0
@@ -107,7 +108,7 @@ class MovementState(State):
 
     def is_active(self, image) -> bool:
         roi = (960, 0, 960, 540)
-        match = self.vision.find_template("minimap_outline", image, threshold=0.3, roi=roi)
+        match = self.vision.find_template("minimap_outline", image, threshold=0.25, roi=roi)
         return match is not None
 
     def on_enter(self):
@@ -340,8 +341,8 @@ class MovementState(State):
 
     def handle_hybrid_recording(self, image):
         current_time = time.time()
-        # Sample every 1.0 second
-        if current_time - self.last_node_time >= 1.0:
+        # Sample every 0.5 seconds (Frequency doubled from 1.0)
+        if current_time - self.last_node_time >= 0.5:
             self.record_hybrid_node(image)
             self.last_node_time = current_time
 
@@ -372,50 +373,140 @@ class MovementState(State):
         self.recording_nodes.append(node)
         print(f"[REC HYBRID] Saved Node {node['id']}")
 
+    def get_minimap_image(self, node):
+        filename = node.get('minimap_path')
+        if not filename: return None
+        
+        path = os.path.join(LANDMARK_DIR, filename)
+        if not os.path.exists(path): return None
+        
+        # Simple cache
+        if not hasattr(self, '_minimap_cache'): self._minimap_cache = {}
+        
+        if path not in self._minimap_cache:
+            img = cv2.imread(path)
+            if img is not None:
+                self._minimap_cache[path] = img
+            else:
+                return None
+            
+        return self._minimap_cache[path]
+
     def handle_hybrid_playback(self, image):
         if not self.landmarks: return
         
-        # Target node
+        # Check if route finished (loop back to start)
         if self.current_landmark_idx >= len(self.landmarks):
-            print("[PLAYBACK] Route finished.")
-            self.stop_all()
-            return
+            print("[PLAYBACK] Route finished. Restarting at Node 0.")
+            self.current_landmark_idx = 0
+            self.arrival_buffer = []
+            if self.current_route_id:
+                set_active_route(self.current_route_id, self.current_landmark_idx)
 
-        target_node = self.landmarks[self.current_landmark_idx]
+        # Lookahead Logic: Compare Current, Next, and Next+1 nodes
+        # BUT only switch if we have "reached" the current node OR if we are lost.
+        # User requirement: "next node must be reached within a reasonable error margin before the system starts moving towards the next node."
         
-        # Load target minimap image
-        filename = target_node.get('minimap_path')
-        if not filename:
-             print("[ERROR] Node missing minimap_path")
-             self.stop_all()
-             return
+        candidates = []
+        lookahead = 3
+        
+        # 1. Evaluate Current Node First
+        current_node = self.landmarks[self.current_landmark_idx]
+        current_mm = self.get_minimap_image(current_node)
+        
+        # Default to current
+        target_mm = current_mm
+        drift = None
+        
+        if current_mm is not None:
+            res = self.navigator.compute_drift(image, current_mm)
+            if res:
+                dx, dy, angle, inliers = res
+                drift = (dx, dy, angle)
 
-        path = os.path.join(LANDMARK_DIR, filename)
-        if not os.path.exists(path):
-            print(f"[ERROR] Missing file {path}")
-            self.stop_all()
-            return
-            
-        # Cache the target minimap to avoid disk I/O every frame
-        if not hasattr(self, '_current_target_mm_path') or self._current_target_mm_path != path:
-            self._current_target_mm = cv2.imread(path)
-            self._current_target_mm_path = path
-            
-        target_mm = self._current_target_mm
-        
-        if target_mm is None:
-             print(f"[ERROR] Failed to load {path}")
-             self.stop_all()
-             return
-        
-        # Calculate Drift
-        drift = self.navigator.compute_drift(image, target_mm)
+                # Maintain arrival rolling window (EMA-style simple buffer)
+                if inliers >= 8:
+                    self.arrival_buffer.append((dx, dy, angle))
+                    if len(self.arrival_buffer) > 5:
+                        self.arrival_buffer.pop(0)
+                else:
+                    # Do not add low-confidence readings
+                    pass
+                
+                # Use averaged dx/dy/angle for arrival check to avoid jumpy triggers
+                mean_dx = dx
+                mean_dy = dy
+                mean_angle = angle
+                if self.arrival_buffer:
+                    n = len(self.arrival_buffer)
+                    mean_dx = sum(v[0] for v in self.arrival_buffer) / n
+                    mean_dy = abs(sum(v[1] for v in self.arrival_buffer) / n)
+                    # Circular mean for angle
+                    s_sin = sum(np.sin(np.radians(v[2])) for v in self.arrival_buffer) / n
+                    s_cos = sum(np.cos(np.radians(v[2])) for v in self.arrival_buffer) / n
+                    mean_angle = np.degrees(np.arctan2(s_sin, s_cos))
+                
+                # ARRIVAL CHECK (Strict-ish)
+                dist = np.sqrt(mean_dx*mean_dx + mean_dy*mean_dy)
+                # Thresholds (tunable): slightly lenient on angle to avoid jitter misses
+                if abs(dist) < 20 and abs(mean_angle) < 15:
+                    print(f"[PLAYBACK] Reached Node {self.current_landmark_idx} (Dist: {dist:.1f}, Ang: {mean_angle:.1f})")
+                    self.current_landmark_idx += 1
+                    self.arrival_buffer = []  # reset buffer for next node
+                    if self.current_route_id:
+                        set_active_route(self.current_route_id, self.current_landmark_idx)
+                    return # Loop will continue next frame with new node
+                
+                # Track the closest approach this node to help with slowdown further below
+                self._approach_dist = dist
+                
+                # If current node tracking is good, we stay here.
+                MIN_INLIERS = 8
+                if inliers >= MIN_INLIERS:
+                    # valid tracking, maintain current target
+                    pass
+                else:
+                    # Current node weak. Check lookahead for recovery.
+                    candidates.append({'idx': self.current_landmark_idx, 'res': res})
+                    
+                    for offset in range(1, lookahead):
+                        idx = self.current_landmark_idx + offset
+                        if idx >= len(self.landmarks): break
+                        
+                        node = self.landmarks[idx]
+                        mm = self.get_minimap_image(node)
+                        if mm is None: continue
+                        
+                        r = self.navigator.compute_drift(image, mm)
+                        if r: candidates.append({'idx': idx, 'res': r})
+                    
+                    # Find best candidate among them
+                    best = None
+                    for c in candidates:
+                        # Prioritize High Inliers
+                        # Increased threshold for recovery jump from 12 to 15 to prevent false positives
+                        if c['res'][3] > 15: # Strong match
+                            if best is None or c['res'][3] > best['res'][3]:
+                                best = c
+                    
+                    if best and best['idx'] > self.current_landmark_idx:
+                        print(f"[PLAYBACK] Lost Node {self.current_landmark_idx}. Recovered at Node {best['idx']} (Inliers: {best['res'][3]})")
+                        self.current_landmark_idx = best['idx']
+                        if self.current_route_id:
+                            set_active_route(self.current_route_id, self.current_landmark_idx)
+                        
+                        drift = (best['res'][0], best['res'][1], best['res'][2])
+                        target_mm = self.get_minimap_image(self.landmarks[self.current_landmark_idx])
+                        # Update debug viz
+                        self.navigator.compute_drift(image, target_mm)
         
         # COASTING & RECOVERY LOGIC:
         # If tracking is lost (drift is None), we attempt to recover by holding the last valid command
         # or slowing down the spin for a few attempts.
         
         if drift is None:
+             # Reset approach distance so we don't reuse stale proximity
+             self._approach_dist = None
              current_time = time.time()
              time_since_last_seen = current_time - self.last_seen_time
              
@@ -493,7 +584,7 @@ class MovementState(State):
             
         # Increased alpha from 0.3 to 0.6 to reduce lag/overshoot
         # Higher alpha = more responsive, less smooth. Lower alpha = smoother, more lag.
-        alpha = 0.6 
+        alpha = 0.75 
         
         self._smoothed_drift['dx'] = alpha * dx + (1 - alpha) * self._smoothed_drift['dx']
         self._smoothed_drift['dy'] = alpha * dy + (1 - alpha) * self._smoothed_drift['dy']
@@ -510,25 +601,14 @@ class MovementState(State):
         self._smoothed_drift['angle'] = np.degrees(np.arctan2(s_sin, s_cos))
         
         sdx, sdy, sangle = self._smoothed_drift['dx'], self._smoothed_drift['dy'], self._smoothed_drift['angle']
-        
+        print(f"[DEBUG] sdx: {sdx}, sdy: {sdy}, sangle: {sangle}")
         # PID / Visual Servo Control
         # If we are "close enough", advance to next node
         # Dist threshold: dx, dy small. Angle small.
         # Use RAW values for "reached" check to allow snap completion, 
         # but smoothed values for control to avoid jitter.
-        dist = np.sqrt(dx*dx + dy*dy)
+        # ARRIVAL CHECK MOVED UPSTREAM
         
-        # Thresholds need tuning
-        # Enforce valid match (drift not None) and check tolerances
-        if dist < 30 and abs(angle) < 5:
-            # Maybe add a "consecutive frames" check to avoid noise?
-            # For now, simple check.
-            print(f"[PLAYBACK] Reached Node {self.current_landmark_idx}")
-            self.current_landmark_idx += 1
-            if self.current_route_id:
-                set_active_route(self.current_route_id, self.current_landmark_idx)
-            return
-
         # Apply Controls
         # Objective: Keep angle at 0 and move forward.
         # Character moves in direction of camera (mostly).
@@ -617,22 +697,27 @@ class MovementState(State):
         move_x = 0.0
         move_y = 0.0
         
-        if abs(sangle) < 15.0: # Increased tolerance slightly to allow movement while correcting
+        if abs(sangle) < 20.0: # Allow movement while still correcting
             # Forward Speed (y)
-            # Max speed 1.0. Scale down as angle increases.
-            # 0 deg -> 1.0 speed
-            # 30 deg -> 0.0 speed (Relaxed from 15)
-            speed_factor = 1.0 - (abs(sangle) / 30.0)
-            move_y = 1.0 * speed_factor
-            
+            # Always drive the stick fully forward when reasonably aligned to force run speed.
+            # If you want softer approach, scale move_y by alignment instead.
+            move_y = 1.0
+
+            # Slow down as we get very close to the node to avoid flying past without triggering
+            approach_dist = getattr(self, "_approach_dist", None)
+            if approach_dist is not None and approach_dist < 60:
+                slowdown = max(0.25, approach_dist / 60.0)
+                move_y *= slowdown
+
+            # Optional: if you want some strafe correction, keep it but cap magnitude.
             # Simple Forward/Back correction based on dy?
             # Actually, the user says "move forward" mainly.
             # But we might need to strafe if dx is large.
             # +dx means we are shifted right? -> Strafe Left?
             # Let's add slight strafe correction if needed.
-            kp_strafe = 0.005 # Reduced from 0.01 to reduce "hard strafing"
-            move_x = -sdx * kp_strafe
-            move_x = max(-0.5, min(0.5, move_x)) # Cap strafe
+            kp_strafe = 0.01 # Reduced from 0.01 to reduce "hard strafing"
+            move_x = sdx * kp_strafe
+            move_x = max(-0.25, min(0.25, move_x)) # Cap strafe
             
         else:
             # Angle too large, stop moving and just rotate

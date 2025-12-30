@@ -13,18 +13,28 @@ class VisualNavigator:
         self.vision = vision_engine
         
         # Default Minimap configuration (Approximate for 1080p, needs calibration)
-        self.minimap_roi = (1580, 50, 300, 300) # x, y, w, h
-        self.minimap_center = (150, 150) # relative to ROI
-        self.minimap_radius = 130
+        # Zoomed out crop (400x400) to include border features
+        # Original Center: (1730, 200) -> 1580+150, 50+150
+        # New ROI: 400x400 centered at (1730, 200)
+        # x = 1730 - 200 = 1530
+        # y = 200 - 200 = 0
+        self.minimap_roi = (1530, 0, 400, 400) # x, y, w, h
+        self.minimap_center = (200, 200) # relative to ROI
+        self.minimap_radius = 190 # Increased from 130 to include border ring (Diam 380)
         
         # Initialize mask
-        self.mask = np.zeros((300, 300), dtype=np.uint8)
+        self.mask = np.zeros((400, 400), dtype=np.uint8)
         self._update_mask()
         
         # Odometry State
         self.last_dx = 0
         self.last_dy = 0
         self.last_angle = 0
+        self.last_matches = []
+        self.last_kp1 = []
+        self.last_kp2 = []
+        self.last_filtered_target = None
+        self.last_filtered_current = None
         
         # Debugging
         self.debug_window_name = "Visual Odometry"
@@ -66,7 +76,7 @@ class VisualNavigator:
             center_y = my + th // 2
             
             # Define new ROI centered on this
-            roi_w, roi_h = 300, 300
+            roi_w, roi_h = 400, 400
             new_x = max(0, center_x - roi_w // 2)
             new_y = max(0, center_y - roi_h // 2)
             
@@ -78,7 +88,7 @@ class VisualNavigator:
             self.minimap_center = (roi_w // 2, roi_h // 2)
             # Radius: roughly fit inside the template ring? 
             # If template is the ring, radius should be slightly less than half width
-            # Let's keep 130 as it seems reasonable for 300px ROI
+            # Let's keep 190 as it seems reasonable for 400px ROI
             
             self._update_mask()
             self.calibrated = True
@@ -117,21 +127,66 @@ class VisualNavigator:
         masked = cv2.bitwise_and(roi_img, roi_img, mask=self.mask)
         return masked
 
-    def compute_drift(self, current_img: np.ndarray, target_minimap: np.ndarray) -> Optional[Tuple[float, float, float]]:
+    def _filter_blue_colors(self, image: np.ndarray) -> np.ndarray:
+        """
+        Filters the image to isolate cyan/blue colors used in the minimap.
+        Returns the filtered BGR image (mostly black with colored lines).
+        """
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        
+        # Tuned based on feedback: Map lines are vivid Electric Cyan.
+        # Background noise appears as "light blue" (pale/washed out) due to transparency.
+        # We increase Saturation and Value thresholds to reject pale/dim noise.
+        
+        # Adjusted Range for Cyan/Blue map lines
+        # H: 80-130 (Centered on Cyan/Blue)
+        # S: > 100 (Increased to remove pale 'light blue' artifacts)
+        # V: > 100 (Increased to keep glowing lines)
+        lower_blue = np.array([80, 60, 100])
+        upper_blue = np.array([140, 255, 255])
+        mask_blue = cv2.inRange(hsv, lower_blue, upper_blue)
+
+        # Additional Gold/Yellow filter for the minimap arrow indicator
+        # Gold/yellow sits around H: 20-40, with high S/V for brightness
+        lower_gold = np.array([20, 120, 180])
+        upper_gold = np.array([30, 255, 255])
+        mask_gold = cv2.inRange(hsv, lower_gold, upper_gold)
+
+        # Combine masks to keep both cyan lines and gold arrow
+        mask = cv2.bitwise_or(mask_blue, mask_gold)
+
+        result = cv2.bitwise_and(image, image, mask=mask)
+        return result
+
+    def compute_drift(self, current_img: np.ndarray, target_minimap: np.ndarray) -> Optional[Tuple[float, float, float, int]]:
         """
         Computes the visual drift between current view and target minimap node.
-        Returns (dx, dy, d_theta) or None if matching failed.
+        Returns (dx, dy, d_theta, inliers_count) or None if matching failed.
         """
         current_minimap = self.extract_minimap(current_img)
         if current_minimap is None or target_minimap is None:
             return None
             
-        # Detect and Compute features
-        kp1, des1 = self.vision.feature_matcher.detect_and_compute(target_minimap, self.mask)
-        kp2, des2 = self.vision.feature_matcher.detect_and_compute(current_minimap, self.mask)
+        # Apply Color Filter to isolate map features
+        filt_current = self._filter_blue_colors(current_minimap)
+        filt_target = self._filter_blue_colors(target_minimap)
+        
+        # Save for debug display
+        self.last_filtered_current = filt_current
+        self.last_filtered_target = filt_target
+            
+        # Detect and Compute features using FILTERED images
+        # Note: self.mask is the circular ROI mask, still applies.
+        kp1, des1 = self.vision.feature_matcher.detect_and_compute(filt_target, self.mask)
+        kp2, des2 = self.vision.feature_matcher.detect_and_compute(filt_current, self.mask)
         
         # Match
         matches = self.vision.feature_matcher.match_features(des1, des2)
+        
+        # Save visualization data
+        self.last_kp1 = kp1
+        self.last_kp2 = kp2
+        self.last_matches = matches
         
         # Compute Homography
         M, mask = self.vision.feature_matcher.compute_homography(kp1, kp2, matches)
@@ -139,14 +194,18 @@ class VisualNavigator:
         if M is None:
             return None
             
+        # Count inliers (sum of mask where val=1)
+        inliers_count = int(np.sum(mask)) if mask is not None else 0
+            
         # Decompose
         dx, dy, angle = self.vision.feature_matcher.decompose_homography(M)
         
         self.last_dx = dx
         self.last_dy = dy
         self.last_angle = angle
+        self.last_inliers_count = inliers_count
         
-        return dx, dy, angle
+        return dx, dy, angle, inliers_count
 
     def show_debug_view(self, current_img: np.ndarray, target_minimap: np.ndarray, controller_state: Dict = None, tracking_active: bool = True, status_msg: str = ""):
         """
@@ -169,20 +228,48 @@ class VisualNavigator:
         
         debug_canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
         
+        # Use Filtered images if available for visualization
+        display_target = self.last_filtered_target if self.last_filtered_target is not None else target_minimap
+        display_current = self.last_filtered_current if self.last_filtered_current is not None else current_minimap
+        
         # Target (Left)
-        if target_minimap is not None:
-             if target_minimap.shape[:2] != (h, w):
-                 target_minimap = cv2.resize(target_minimap, (w, h))
+        if display_target is not None:
+             if display_target.shape[:2] != (h, w):
+                 display_target = cv2.resize(display_target, (w, h))
              
              # Apply mask to Target for display consistency
-             masked_target = cv2.bitwise_and(target_minimap, target_minimap, mask=self.mask)
+             masked_target = cv2.bitwise_and(display_target, display_target, mask=self.mask)
              debug_canvas[0:h, 0:w] = masked_target
         
         # Current (Right)
-        debug_canvas[0:h, w+20:w*2+20] = current_minimap
+        if display_current is not None:
+             debug_canvas[0:h, w+20:w*2+20] = display_current
+        
+        # Draw Matches if available
+        if self.last_matches and self.last_kp1 and self.last_kp2:
+            # We need to draw lines connecting points
+            # Offset for right image is (w + 20, 0)
+            offset_x = w + 20
+            
+            for m in self.last_matches:
+                # Keypoint in Target (Left)
+                pt1 = self.last_kp1[m.queryIdx].pt
+                # Keypoint in Current (Right)
+                pt2 = self.last_kp2[m.trainIdx].pt
+                
+                start_point = (int(pt1[0]), int(pt1[1]))
+                end_point = (int(pt2[0] + offset_x), int(pt2[1]))
+                
+                # Draw line
+                cv2.line(debug_canvas, start_point, end_point, (0, 255, 0), 1)
+                # Draw points
+                cv2.circle(debug_canvas, start_point, 2, (0, 255, 255), -1)
+                cv2.circle(debug_canvas, end_point, 2, (0, 255, 255), -1)
         
         # Overlay Info (Drift)
         info_text = f"dx: {self.last_dx:.2f}, dy: {self.last_dy:.2f}, ang: {self.last_angle:.2f}"
+        if hasattr(self, 'last_inliers_count'):
+             info_text += f", N: {self.last_inliers_count}"
         cv2.putText(debug_canvas, info_text, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
         
         # Draw flow arrow on Current
