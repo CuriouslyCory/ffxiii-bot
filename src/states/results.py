@@ -16,7 +16,7 @@ class ResultsState(State):
         :return: True if results screen is detected.
         """
         roi = (0, 0, 960, 540)
-        has_results_header = self.vision.find_template("battle_results", image, threshold=0.7, roi=roi) is not None
+        has_results_header = self.vision.find_template("battle_results", image, threshold=0.9, roi=roi) is not None
         
         return has_results_header
 

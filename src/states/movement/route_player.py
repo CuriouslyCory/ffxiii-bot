@@ -6,6 +6,7 @@ import time
 import os
 import cv2
 import numpy as np
+import random
 from typing import List, Dict, Any, Optional, Tuple
 from .route_manager import LANDMARK_DIR
 from .navigation_controller import NavigationController
@@ -16,7 +17,10 @@ from .constants import (
     LANDMARK_DEADZONE, LANDMARK_MAX_OFFSET_X_FACTOR, LANDMARK_MAX_OFFSET_Y_FACTOR,
     LANDMARK_MAX_SPEED, LANDMARK_MOVE_THRESHOLD, LANDMARK_COAST_DURATION,
     LANDMARK_SEARCH_START_DELAY, LANDMARK_SEEK_TIMEOUT, LANDMARK_SEEK_TOGGLE_INTERVAL,
-    ARRIVAL_BUFFER_SIZE
+    ARRIVAL_BUFFER_SIZE,
+    RANDOM_TURN_INTERVAL_MIN, RANDOM_TURN_INTERVAL_MAX,
+    RANDOM_TURN_DURATION_MIN, RANDOM_TURN_DURATION_MAX,
+    RANDOM_CAMERA_PAN_SPEED
 )
 
 
@@ -570,6 +574,91 @@ class HybridPlayer:
             'status': status,
             'current_idx': current_idx
         }
+
+
+class RandomMovementPlayer:
+    """
+    Handles semi-random movement playback.
+    
+    Continuously moves forward while randomly panning the camera left or right at intervals.
+    """
+    
+    def __init__(self, controller):
+        """
+        Initialize the random movement player.
+        
+        Args:
+            controller: Controller for movement commands.
+        """
+        self.controller = controller
+        self.next_turn_time = 0.0
+        self.turn_end_time = 0.0
+        self.is_turning = False
+        self.turn_direction = 1  # 1 for right, -1 for left
+    
+    def start(self):
+        """Reset state and generate first random turn interval."""
+        current_time = time.time()
+        interval = random.uniform(RANDOM_TURN_INTERVAL_MIN, RANDOM_TURN_INTERVAL_MAX)
+        self.next_turn_time = current_time + interval
+        self.turn_end_time = 0.0
+        self.is_turning = False
+        print(f"[RANDOM] Starting random movement mode. First turn in {interval:.2f}s")
+    
+    def process_frame(self, image: np.ndarray) -> Dict[str, Any]:
+        """
+        Process a frame during random movement playback.
+        
+        Args:
+            image: Current screen image (unused but kept for interface consistency).
+            
+        Returns:
+            Dictionary with movement commands.
+        """
+        current_time = time.time()
+        
+        # Always move forward
+        move_x = 0.0
+        move_y = -1.0  # Forward movement
+        cam_x = 0.0
+        cam_y = 0.0
+        
+        # Check if we should start a new turn
+        if not self.is_turning and current_time >= self.next_turn_time:
+            # Start a new turn
+            self.is_turning = True
+            # 1 in 5 chance (20%) to turn left, otherwise turn right
+            self.turn_direction = -1 if random.random() < 0.2 else 1
+            turn_duration = random.uniform(RANDOM_TURN_DURATION_MIN, RANDOM_TURN_DURATION_MAX)
+            self.turn_end_time = current_time + turn_duration
+            direction_str = "left" if self.turn_direction < 0 else "right"
+            print(f"[RANDOM] Starting turn {direction_str} for {turn_duration:.2f}s")
+        
+        # Check if we should end the current turn
+        if self.is_turning and current_time >= self.turn_end_time:
+            # End the turn and schedule next one
+            self.is_turning = False
+            interval = random.uniform(RANDOM_TURN_INTERVAL_MIN, RANDOM_TURN_INTERVAL_MAX)
+            self.next_turn_time = current_time + interval
+            print(f"[RANDOM] Turn ended. Next turn in {interval:.2f}s")
+        
+        # Apply camera pan if turning (left or right based on turn_direction)
+        if self.is_turning:
+            cam_x = RANDOM_CAMERA_PAN_SPEED * self.turn_direction
+        
+        return {
+            'cam_x': cam_x,
+            'cam_y': cam_y,
+            'move_x': move_x,
+            'move_y': move_y
+        }
+    
+    def stop(self):
+        """Clean up state."""
+        self.is_turning = False
+        self.next_turn_time = 0.0
+        self.turn_end_time = 0.0
+        print("[RANDOM] Random movement mode stopped.")
 
 
 class RoutePlayer:

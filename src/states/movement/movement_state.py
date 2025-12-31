@@ -17,7 +17,7 @@ from src.states.visual_navigator import VisualNavigator
 from .input_handler import InputHandler, Action
 from .route_manager import RouteManager
 from .route_recorder import RouteRecorder
-from .route_player import RoutePlayer
+from .route_player import RoutePlayer, RandomMovementPlayer
 from .navigation_controller import NavigationController
 from .seek_strategy import SeekStrategy
 from .debug_visualizer import DebugVisualizer
@@ -49,6 +49,7 @@ class MovementState(State):
             self.vision, self.controller, self.navigator,
             self.nav_controller, self.seek_strategy
         )
+        self.random_player = RandomMovementPlayer(self.controller)
         
         # State
         self.mode = "IDLE"
@@ -103,13 +104,13 @@ class MovementState(State):
         print(f"\n--- Movement State ({self.mode}) ---")
         print("Controls:")
         print("  'r': Start New Recording (will prompt for type)")
-        print("  'p': Playback Route (List/Select)")
+        print("  'p': Playback Menu (0=Random Movement, 1-9=Select Route)")
         print("  'u': Resume Current Loaded Route")
         print("  'd': Toggle HSV Filter Debug Mode (during playback)")
         print("  '2': Delete Current Image (during playback)")
         print("  '3': Delete Next Image (during playback)")
         print("  '4': Delete Next Node (during playback)")
-        print("  'ESC': Stop Playback/Recording")
+        print("  'ESC': Stop Playback/Recording/Random Movement")
         
         if self.mode == "RECORDING":
             print("  [RESUMED] Recording in progress.")
@@ -128,7 +129,10 @@ class MovementState(State):
         if self.navigator.hsv_debug_enabled:
             self.navigator.disable_hsv_debug()
         
-        if self.mode == "PLAYBACK" and self.current_route_id:
+        if self.mode == "RANDOM_MOVEMENT":
+            self.random_player.stop()
+            print("[PAUSED] Random movement paused (entered another state).")
+        elif self.mode == "PLAYBACK" and self.current_route_id:
             self.route_manager.set_active_route(self.current_route_id, self.current_landmark_idx)
             print("[PAUSED] Playback paused (entered another state).")
         elif self.mode == "RECORDING":
@@ -149,7 +153,12 @@ class MovementState(State):
             elif action == Action.SELECT_ROUTE:
                 idx = self.input_handler.get_select_route_value()
                 if idx is not None and self.mode == "SELECTING":
-                    self.select_route(idx)
+                    if idx == 0:
+                        self.start_random_movement()
+                    else:
+                        self.select_route(idx)
+            elif action == Action.RANDOM_MOVEMENT:
+                self.start_random_movement()
             elif action == Action.DELETE_CURRENT_IMAGE:
                 if self.mode == "PLAYBACK":
                     self.delete_image_from_step(self.current_landmark_idx)
@@ -195,6 +204,8 @@ class MovementState(State):
             self.handle_recording(image)
         elif self.mode == "PLAYBACK":
             self.handle_playback(image)
+        elif self.mode == "RANDOM_MOVEMENT":
+            self.handle_random_movement(image)
     
     def handle_recording(self, image: np.ndarray):
         """Handle recording mode."""
@@ -204,6 +215,14 @@ class MovementState(State):
             # LANDMARK mode
             step_count = self.route_recorder.get_step_count()
             self.debug_visualizer.show_recording_preview(image, step_count)
+    
+    def handle_random_movement(self, image: np.ndarray):
+        """Handle random movement mode."""
+        result = self.random_player.process_frame(image)
+        
+        # Apply controls
+        self.controller.move_camera(result['cam_x'], result['cam_y'])
+        self.controller.move_character(result['move_x'], result['move_y'])
     
     def handle_playback(self, image: np.ndarray):
         """Handle playback mode."""
@@ -274,6 +293,8 @@ class MovementState(State):
     def stop_all(self):
         """Stop all activities and return to IDLE."""
         print("[STOP] Stopping all activities. Returning to IDLE.")
+        if self.mode == "RANDOM_MOVEMENT":
+            self.random_player.stop()
         self.mode = "IDLE"
         self.controller.release_all()
         self.debug_visualizer.cleanup_windows()
@@ -348,10 +369,12 @@ class MovementState(State):
         """List available routes for selection."""
         self.mode = "SELECTING"
         routes = self.route_manager.list_available_routes()
+        print("\n--- Playback Menu ---")
+        print(" 0. Random Movement Mode")
         print("\n--- Available Routes ---")
         for i, r in enumerate(routes):
             print(f" {i+1}. {r[1]} [{r[3]}] (Created: {r[2]})")
-        print("Press number key (1-9) to select a route to load.")
+        print("Press number key (0-9) to select an option.")
     
     def select_route(self, index: int):
         """Select a route by index."""
@@ -387,6 +410,12 @@ class MovementState(State):
         
         print(f"[SELECTED] Route '{route_data['name']}' loaded. Press 'u' to start.")
         self.mode = "IDLE"
+    
+    def start_random_movement(self):
+        """Start random movement mode."""
+        self.mode = "RANDOM_MOVEMENT"
+        self.random_player.start()
+        print("\n[RANDOM] Random movement mode started. Press ESC to stop.")
     
     def start_playback(self):
         """Start playback of loaded route."""

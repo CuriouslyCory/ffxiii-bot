@@ -22,6 +22,7 @@ class Action(Enum):
     DELETE_NEXT_IMAGE = "delete_next_image"
     DELETE_NEXT_NODE = "delete_next_node"
     TOGGLE_HSV_DEBUG = "toggle_hsv_debug"
+    RANDOM_MOVEMENT = "random_movement"
 
 
 class InputHandler:
@@ -99,6 +100,8 @@ class InputHandler:
             self._add_action(Action.DELETE_NEXT_IMAGE)
         elif k_char == '4':
             self._add_action(Action.DELETE_NEXT_NODE)
+        elif k_char == '0':
+            self._add_action(Action.RANDOM_MOVEMENT)
         elif k_char in [str(i) for i in range(1, 10)]:
             self._select_route_value = int(k_char)
             self._add_action(Action.SELECT_ROUTE)
