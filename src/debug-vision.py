@@ -18,7 +18,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from src.vision import VisionEngine
+from src.core.vision import VisionEngine
 
 def main():
     # Configuration: Match these with your game settings/main.py

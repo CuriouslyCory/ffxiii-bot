@@ -94,7 +94,7 @@ MESH_WARPING_BLEND_RADIUS = 5  # Blending radius in pixels
 
 # Random Movement Mode
 RANDOM_TURN_INTERVAL_MIN = 1.0  # Minimum seconds between turns
-RANDOM_TURN_INTERVAL_MAX = 10.0  # Maximum seconds between turns
+RANDOM_TURN_INTERVAL_MAX = 13.0  # Maximum seconds between turns
 RANDOM_TURN_DURATION_MIN = 0.5  # Minimum seconds for a turn
 RANDOM_TURN_DURATION_MAX = 1.0  # Maximum seconds for a turn
 RANDOM_CAMERA_PAN_SPEED = 0.75  # Camera pan speed when turning right

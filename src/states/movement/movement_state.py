@@ -3,6 +3,7 @@ Movement state for handling navigation in the open world.
 
 Main orchestrator that delegates to specialized components for recording,
 playback, navigation, and visualization.
+Updated to use new architecture (skills, sensors, filters, visualizers, UI).
 """
 
 import time
@@ -14,7 +15,11 @@ import numpy as np
 import cv2
 from src.states.base import State
 from src.states.visual_navigator import VisualNavigator
-from .input_handler import InputHandler, Action
+from src.ui.input_handler import InputHandler
+from src.ui.menu import MenuDefinition, MenuItem, MenuManager
+from src.ui.text_input import TextInputDialog
+from src.skills.movement import MovementSkill, CameraSkill
+from src.visualizers.route import RoutePlaybackVisualizer, RecordingPreviewVisualizer
 from .route_manager import RouteManager
 from .route_recorder import RouteRecorder
 from .route_player import RoutePlayer, RandomMovementPlayer
@@ -29,6 +34,7 @@ class MovementState(State):
     
     Supports both LANDMARK and HYBRID visual odometry navigation modes.
     Acts as a thin orchestrator delegating to specialized components.
+    Now uses new architecture: skills, sensors, filters, visualizers, and UI components.
     """
     
     def __init__(self, manager):
@@ -37,10 +43,27 @@ class MovementState(State):
         
         # Core components
         self.navigator = VisualNavigator(self.vision)
-        self.input_handler = InputHandler()
         self.route_manager = RouteManager(self.vision)
         self.nav_controller = NavigationController()
         self.seek_strategy = SeekStrategy()
+        
+        # New UI system
+        self.input_handler = InputHandler()
+        self.menu_manager = MenuManager(self.input_handler)
+        self.text_input = TextInputDialog()
+        
+        # Set up menu manager and input handler in base class
+        self.menu_manager = self.menu_manager
+        self.input_handler = self.input_handler
+        
+        # Skills
+        self.movement_skill = MovementSkill(self.controller)
+        self.camera_skill = CameraSkill(self.controller)
+        
+        # Visualizers
+        self.route_playback_viz = RoutePlaybackVisualizer()
+        self.recording_preview_viz = RecordingPreviewVisualizer()
+        # Keep old debug visualizer for now (for odometry/HSV debug that's integrated into navigator)
         self.debug_visualizer = DebugVisualizer(self.navigator)
         
         # Recording and playback components
@@ -98,19 +121,30 @@ class MovementState(State):
         match = self.vision.find_template("minimap_outline", image, threshold=0.25, roi=roi)
         return match is not None
     
+    def get_menu(self) -> MenuDefinition:
+        """
+        Get menu definition for movement state.
+        
+        Returns:
+            MenuDefinition with movement state controls
+        """
+        return MenuDefinition(
+            title="Movement State",
+            items=[
+                MenuItem('r', 'Start New Recording (will prompt for type)', 'RECORD_MODE'),
+                MenuItem('p', 'Playback Menu (0=Random Movement, 1-9=Select Route)', 'LIST_ROUTES'),
+                MenuItem('u', 'Resume Current Loaded Route', 'PLAYBACK'),
+                MenuItem('d', 'Toggle HSV Filter Debug Mode (during playback)', 'TOGGLE_HSV_DEBUG'),
+                MenuItem('2', 'Delete Current Image (during playback)', 'DELETE_CURRENT_IMAGE'),
+                MenuItem('3', 'Delete Next Image (during playback)', 'DELETE_NEXT_IMAGE'),
+                MenuItem('4', 'Delete Next Node (during playback)', 'DELETE_NEXT_NODE'),
+            ]
+        )
+    
     def on_enter(self):
         """Called when entering the state."""
-        self.input_handler.set_listening(True)
+        super().on_enter()  # This calls attach_input_listeners()
         print(f"\n--- Movement State ({self.mode}) ---")
-        print("Controls:")
-        print("  'r': Start New Recording (will prompt for type)")
-        print("  'p': Playback Menu (0=Random Movement, 1-9=Select Route)")
-        print("  'u': Resume Current Loaded Route")
-        print("  'd': Toggle HSV Filter Debug Mode (during playback)")
-        print("  '2': Delete Current Image (during playback)")
-        print("  '3': Delete Next Image (during playback)")
-        print("  '4': Delete Next Node (during playback)")
-        print("  'ESC': Stop Playback/Recording/Random Movement")
         
         if self.mode == "RECORDING":
             print("  [RESUMED] Recording in progress.")
@@ -119,10 +153,18 @@ class MovementState(State):
     
     def on_exit(self):
         """Called when exiting the state."""
-        self.input_handler.set_listening(False)
-        self.controller.move_character(0.0, 0.0)
-        self.controller.move_camera(0.0, 0.0)
+        super().on_exit()  # This calls detach_input_listeners()
+        
+        # Stop movement and camera using skills
+        self.movement_skill.stop()
+        self.camera_skill.stop()
         self.controller.release_all()
+        
+        # Cleanup visualizers (only if they were shown)
+        if self.route_playback_viz.is_visible():
+            self.route_playback_viz.cleanup()
+        if self.recording_preview_viz.is_visible():
+            self.recording_preview_viz.cleanup()
         self.debug_visualizer.cleanup_windows()
         
         # Disable HSV debug if active
@@ -140,62 +182,67 @@ class MovementState(State):
     
     def execute(self, image):
         """Main execution loop."""
-        # Process input actions
+        # Process input actions using new input handler
         actions = self.input_handler.get_pending_actions()
         
         for action in actions:
-            if action == Action.STOP:
+            if action == 'STOP':
                 self.stop_all()
-            elif action == Action.RECORD_MODE:
+            elif action == 'RECORD_MODE':
                 self.start_recording_dialog()
-            elif action == Action.LIST_ROUTES:
+            elif action == 'LIST_ROUTES':
                 self.list_available_routes()
-            elif action == Action.SELECT_ROUTE:
-                idx = self.input_handler.get_select_route_value()
-                if idx is not None and self.mode == "SELECTING":
-                    if idx == 0:
-                        self.start_random_movement()
-                    else:
-                        self.select_route(idx)
-            elif action == Action.RANDOM_MOVEMENT:
+            elif action == 'SELECT_ROUTE':
+                data = self.input_handler.get_action_data('SELECT_ROUTE')
+                if data and 'key' in data:
+                    try:
+                        idx = int(data['key'])
+                        if idx is not None and self.mode == "SELECTING":
+                            if idx == 0:
+                                self.start_random_movement()
+                            else:
+                                self.select_route(idx)
+                    except ValueError:
+                        pass
+            elif action == 'RANDOM_MOVEMENT':
                 self.start_random_movement()
-            elif action == Action.DELETE_CURRENT_IMAGE:
+            elif action == 'DELETE_CURRENT_IMAGE':
                 if self.mode == "PLAYBACK":
                     self.delete_image_from_step(self.current_landmark_idx)
-            elif action == Action.DELETE_NEXT_IMAGE:
+            elif action == 'DELETE_NEXT_IMAGE':
                 if self.mode == "PLAYBACK" and self.landmarks:
                     next_idx = (self.current_landmark_idx + 1) % len(self.landmarks)
                     self.delete_image_from_step(next_idx)
-            elif action == Action.DELETE_NEXT_NODE:
+            elif action == 'DELETE_NEXT_NODE':
                 if self.mode == "PLAYBACK" and self.landmarks:
                     next_idx = self.current_landmark_idx + 1
                     if next_idx < len(self.landmarks):
                         self.delete_next_node(next_idx)
                     else:
                         print("[DELETE] No next node to delete (at end of route).")
-            elif action == Action.TOGGLE_HSV_DEBUG:
+            elif action == 'TOGGLE_HSV_DEBUG':
                 if self.navigator.hsv_debug_enabled:
                     self.navigator.disable_hsv_debug()
                 else:
                     self.navigator.enable_hsv_debug()
-            elif action == Action.PLAYBACK:
+            elif action == 'PLAYBACK':
                 self.start_playback()
-            elif action == Action.SAVE_EXIT:
+            elif action == 'SAVE_EXIT':
                 if self.mode == "RECORDING":
                     self.finish_recording()
-            elif action == Action.CAPTURE:
+            elif action == 'CAPTURE':
                 if self.mode == "RECORDING":
                     self.route_recorder.capture_image(image)
                 elif self.mode == "PLAYBACK":
                     self.add_image_to_playback_step(self.current_landmark_idx, image)
-            elif action == Action.NEXT_STEP:
+            elif action == 'NEXT_STEP':
                 if self.mode == "RECORDING":
                     self.route_recorder.finish_step()
                 elif self.mode == "PLAYBACK":
                     if self.landmarks:
                         next_idx = (self.current_landmark_idx + 1) % len(self.landmarks)
                         self.add_image_to_playback_step(next_idx, image)
-            elif action == Action.RETAKE:
+            elif action == 'RETAKE':
                 if self.mode == "RECORDING":
                     self.route_recorder.retake_last_image()
         
@@ -212,17 +259,22 @@ class MovementState(State):
         if self.route_type == "HYBRID":
             self.route_recorder.process_frame(image)
         else:
-            # LANDMARK mode
+            # LANDMARK mode - use new visualizer
             step_count = self.route_recorder.get_step_count()
-            self.debug_visualizer.show_recording_preview(image, step_count)
+            if self.recording_preview_viz.is_visible():
+                preview_img = self.recording_preview_viz.render(image, {'step_count': step_count})
+                cv2.imshow(self.recording_preview_viz.window_name, preview_img)
+                cv2.waitKey(1)
+            else:
+                self.recording_preview_viz.show()
     
     def handle_random_movement(self, image: np.ndarray):
         """Handle random movement mode."""
         result = self.random_player.process_frame(image)
         
-        # Apply controls
-        self.controller.move_camera(result['cam_x'], result['cam_y'])
-        self.controller.move_character(result['move_x'], result['move_y'])
+        # Apply controls using skills
+        self.camera_skill.move(result['cam_x'], result['cam_y'])
+        self.movement_skill.move(result['move_x'], result['move_y'])
     
     def handle_playback(self, image: np.ndarray):
         """Handle playback mode."""
@@ -241,11 +293,11 @@ class MovementState(State):
             elif 'current_idx' in result:
                 self.current_landmark_idx = result['current_idx']
             
-            # Apply controls
-            self.controller.move_camera(result['cam_x'], result['cam_y'])
-            self.controller.move_character(result['move_x'], result['move_y'])
+            # Apply controls using skills
+            self.camera_skill.move(result['cam_x'], result['cam_y'])
+            self.movement_skill.move(result['move_x'], result['move_y'])
             
-            # Show debug
+            # Show debug (still using old visualizer for odometry)
             self.debug_visualizer.show_odometry_debug(
                 image, result.get('target_mm'),
                 self.controller.state,
@@ -269,9 +321,9 @@ class MovementState(State):
                         self.current_route_id, self.current_landmark_idx
                     )
             
-            # Apply controls
-            self.controller.move_camera(result['cam_x'], result['cam_y'])
-            self.controller.move_character(result['move_x'], result['move_y'])
+            # Apply controls using skills
+            self.camera_skill.move(result['cam_x'], result['cam_y'])
+            self.movement_skill.move(result['move_x'], result['move_y'])
             
             # Get next target filename for debug view
             next_idx = (self.current_landmark_idx + 1) % len(self.landmarks)
@@ -280,15 +332,22 @@ class MovementState(State):
                 next_step = self.landmarks[next_idx]
                 next_filename = next_step['images'][0]['filename'] if next_step.get('images') else None
             
-            # Show debug
-            self.debug_visualizer.show_playback_debug(
-                image, result.get('match'),
-                result.get('target_name', 'Unknown'),
-                self.current_landmark_idx, len(self.landmarks),
-                result.get('target_filename'),
-                next_filename,
-                self.route_player.landmark_player.seek_active
-            )
+            # Use new visualizer for playback debug
+            if self.route_playback_viz.is_visible():
+                viz_data = {
+                    'match': result.get('match'),
+                    'target_name': result.get('target_name', 'Unknown'),
+                    'current_idx': self.current_landmark_idx,
+                    'total_steps': len(self.landmarks),
+                    'target_filename': result.get('target_filename'),
+                    'next_target_filename': next_filename,
+                    'seek_active': self.route_player.landmark_player.seek_active
+                }
+                viz_img = self.route_playback_viz.render(image, viz_data)
+                cv2.imshow(self.route_playback_viz.window_name, viz_img)
+                cv2.waitKey(1)
+            else:
+                self.route_playback_viz.show()
     
     def stop_all(self):
         """Stop all activities and return to IDLE."""
@@ -296,41 +355,38 @@ class MovementState(State):
         if self.mode == "RANDOM_MOVEMENT":
             self.random_player.stop()
         self.mode = "IDLE"
+        self.movement_skill.stop()
+        self.camera_skill.stop()
         self.controller.release_all()
+        if self.route_playback_viz.is_visible():
+            self.route_playback_viz.cleanup()
+        if self.recording_preview_viz.is_visible():
+            self.recording_preview_viz.cleanup()
         self.debug_visualizer.cleanup_windows()
         self.route_manager.clear_active_route()
     
     def start_recording_dialog(self):
         """Start recording with type selection dialog."""
+        # For now, use simple print/input approach
+        # Could be enhanced with a proper menu dialog later
         self.input_handler.set_blocking(True)
         try:
-            # Flush stdin
-            try:
-                termios.tcflush(sys.stdin, termios.TCIOFLUSH)
-            except:
-                pass
+            print("\nSelect Recording Type:")
+            print("  1. Landmark Routing")
+            print("  2. Hybrid Visual Odometry")
+            print("  q. Cancel")
             
-            while True:
-                print("\nSelect Recording Type:")
-                print("  1. Landmark Routing")
-                print("  2. Hybrid Visual Odometry")
-                print("  q. Cancel")
-                
-                choice = input("> ").strip().lower()
-                
-                if choice == '1':
-                    self.start_recording("LANDMARK")
-                    break
-                elif choice == '2':
-                    self.start_recording("HYBRID")
-                    break
-                elif choice == 'q':
-                    print("Cancelled.")
-                    break
-                elif choice == '':
-                    continue
-                else:
-                    print(f"Invalid selection: '{choice}'. Please enter 1 or 2.")
+            # Use simple input for now (text input dialog is better for route names)
+            choice = input("> ").strip().lower()
+            
+            if choice == '1':
+                self.start_recording("LANDMARK")
+            elif choice == '2':
+                self.start_recording("HYBRID")
+            elif choice == 'q':
+                print("Cancelled.")
+        except Exception as e:
+            print(f"Error: {e}")
         finally:
             self.input_handler.set_blocking(False)
     
@@ -339,18 +395,21 @@ class MovementState(State):
         self.mode = "RECORDING"
         self.route_type = r_type
         self.route_recorder.start_recording(r_type)
+        self.recording_preview_viz.show()
     
     def finish_recording(self):
         """Finish recording and save route."""
         data, master_map_path = self.route_recorder.finish_recording()
         
+        self.movement_skill.stop()
+        self.camera_skill.stop()
         self.controller.release_all()
+        self.recording_preview_viz.cleanup()
         self.debug_visualizer.cleanup_windows()
         
         self.input_handler.set_blocking(True)
-        print("\n[INPUT REQUIRED] Enter name for this route:")
         try:
-            name = input("> ").strip()
+            name = self.text_input.prompt("Enter name for this route", "")
             if not name:
                 name = f"Route_{int(time.time())}"
             
@@ -358,8 +417,6 @@ class MovementState(State):
                 print(f"[SAVED] Route '{name}' saved to database.")
             else:
                 print("[ERROR] Failed to save route.")
-        except Exception as e:
-            print(f"[ERROR] Input error: {e}")
         finally:
             self.input_handler.set_blocking(False)
         
@@ -391,9 +448,9 @@ class MovementState(State):
         active = self.route_manager.get_active_route()
         if active and str(active['route_id']) == str(route_id):
             self.input_handler.set_blocking(True)
-            print(f"\n[RESUME] Route '{route_data['name']}' is in progress at step {active['current_idx']}.")
-            print("  Do you want to Resume from there? (y/n)")
             try:
+                print(f"\n[RESUME] Route '{route_data['name']}' is in progress at step {active['current_idx']}.")
+                print("  Do you want to Resume from there? (y/n)")
                 ans = input("> ").strip().lower()
                 if ans == 'y':
                     start_idx = int(active['current_idx'])
@@ -410,6 +467,7 @@ class MovementState(State):
         
         print(f"[SELECTED] Route '{route_data['name']}' loaded. Press 'u' to start.")
         self.mode = "IDLE"
+        self.route_playback_viz.show()
     
     def start_random_movement(self):
         """Start random movement mode."""
@@ -430,6 +488,7 @@ class MovementState(State):
             self.route_manager.set_active_route(self.current_route_id, self.current_landmark_idx)
         
         print(f"\n[PLAYBACK] Starting/Resuming at step {self.current_landmark_idx}.")
+        self.route_playback_viz.show()
     
     def add_image_to_playback_step(self, step_idx: int, image: np.ndarray):
         """Add an image to a step during playback."""

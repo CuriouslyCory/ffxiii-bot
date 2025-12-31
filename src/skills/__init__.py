@@ -1,0 +1,1 @@
+"""Skills: Bot interaction capabilities."""

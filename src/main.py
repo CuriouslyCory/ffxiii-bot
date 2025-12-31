@@ -6,9 +6,9 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from src.vision import VisionEngine
-from src.controller import Controller
-from src.states.manager import StateManager
+from src.core.vision import VisionEngine
+from src.core.controller import Controller
+from src.core.manager import StateManager
 from src.states.movement import MovementState
 from src.states.battle import BattleState
 from src.states.results import ResultsState
