@@ -686,6 +686,9 @@ class MovementState(State):
 
         # Drift is valid
         self.last_seen_time = time.time()
+
+        # dx & dy tell us how the map should translate to match the target
+        # The player needs to move in the opposite direction to move the map to the target
         dx, dy, angle = drift
         
         # Smoothing: Use EMA (Exponential Moving Average)
@@ -779,7 +782,6 @@ class MovementState(State):
         
         if abs(sangle) < 180.0: # Allow movement while still correcting
             # Forward Speed (y)
-            # Always drive the stick fully forward when reasonably aligned to force run speed.
             # If you want softer approach, scale move_y by alignment instead.
             move_y = -1.0 * (sdy / abs(sdy))
             print(f"[DEBUG] move_y: {move_y}")

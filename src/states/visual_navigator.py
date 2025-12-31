@@ -3,6 +3,28 @@ import numpy as np
 import time
 import os
 from typing import Optional, Tuple, Dict
+from .movement.constants import (
+    PHASE_CORR_CONFIDENCE_THRESHOLD,
+    ARRIVAL_DISTANCE_THRESHOLD,
+    ARRIVAL_ANGLE_THRESHOLD,
+    ARRIVAL_BUFFER_SIZE,
+    ENABLE_ADVANCED_STITCHING,
+    ENABLE_MESH_WARPING,
+    SUPERPOINT_N_FEATURES,
+    SUPERPOINT_DEVICE,
+    LIGHTGLUE_FILTER_THRESHOLD,
+    LIGHTGLUE_DEVICE,
+    MAGSAC_METHOD,
+    MAGSAC_THRESHOLD,
+    MAGSAC_CONFIDENCE,
+    MAGSAC_MAX_ITERS,
+    BUNDLE_ADJUSTMENT_MAX_ITERS,
+    BUNDLE_ADJUSTMENT_FTOL,
+    BUNDLE_ADJUSTMENT_XTOL,
+    BUNDLE_ADJUSTMENT_GTOL,
+    MESH_WARPING_GRID_SIZE,
+    MESH_WARPING_BLEND_RADIUS
+)
 
 class VisualNavigator:
     """
@@ -62,7 +84,7 @@ class VisualNavigator:
         self.MINIMAP_CENTER_Y = 200  # Before stretch
         self.MINIMAP_CENTER_STRETCHED_X = 200
         self.MINIMAP_CENTER_STRETCHED_Y = 260
-        self.MINIMAP_RADIUS = 190
+        self.MINIMAP_RADIUS = 150  # Aggressively reduced to eliminate border artifacts (was 190, then 170)
         self.CIRCULAR_CROP_Y1 = 60  # For extracting 400x400 from 400x520
         self.CIRCULAR_CROP_Y2 = 460
         
@@ -73,7 +95,7 @@ class VisualNavigator:
         
         # Alert/Red filter (enemy nearby state - two ranges for HSV wheel wrap)
         self.alert_lower = [0, 40, 50]
-        self.alert_upper = [30, 255, 255]
+        self.alert_upper = [13, 255, 255]
         self.red_lower = [170, 40, 50]
         self.red_upper = [180, 255, 255]
         
@@ -86,17 +108,21 @@ class VisualNavigator:
         # --- Dynamic Circle Masking (for enemy dots and AI team circles) ---
         # NOTE: HSV ranges must match or be broader than main color filter ranges
         # to ensure red dots that pass color filter can be detected and masked
-        self.CIRCLE_MIN_RADIUS = 3  # Reduced to catch smaller enemy dots
+        self.CIRCLE_MIN_RADIUS = 7  # Reduced to catch smaller enemy dots
         self.CIRCLE_MAX_RADIUS = 13
         # Use same or broader ranges as main alert/red filter to catch all red dots
         self.CIRCLE_DETECTION_RED_LOWER1 = [0, 40, 50]  # Match alert_lower
         self.CIRCLE_DETECTION_RED_UPPER1 = [30, 255, 255]  # Match alert_upper
         self.CIRCLE_DETECTION_RED_LOWER2 = [170, 40, 50]  # Match red_lower
         self.CIRCLE_DETECTION_RED_UPPER2 = [180, 255, 255]  # Match red_upper
-        self.CIRCLE_DETECTION_BLUE_LOWER = [100, 100, 100]
-        self.CIRCLE_DETECTION_BLUE_UPPER = [130, 255, 255]
-        self.CIRCLE_DETECTION_WHITE_LOWER = [0, 0, 200]
-        self.CIRCLE_DETECTION_WHITE_UPPER = [180, 30, 255]
+        # Expanded blue/cyan range for teammate circles (broader to catch variations)
+        self.CIRCLE_DETECTION_BLUE_LOWER = [90, 80, 80]  # Expanded from [100, 100, 100]
+        self.CIRCLE_DETECTION_BLUE_UPPER = [140, 255, 255]  # Expanded from [130, 255, 255]
+        # Also detect cyan/light blue (common for teammate indicators)
+        self.CIRCLE_DETECTION_CYAN_LOWER = [85, 60, 60]
+        self.CIRCLE_DETECTION_CYAN_UPPER = [100, 255, 255]
+        self.CIRCLE_DETECTION_WHITE_LOWER = [0, 0, 180]  # Lowered from 200 to catch more white/light centers
+        self.CIRCLE_DETECTION_WHITE_UPPER = [180, 50, 255]  # Increased saturation tolerance from 30 to 50
         self.CIRCLE_MASK_PADDING = 4  # Pixels to add around detected circles
         
         # --- Edge Detection Parameters ---
@@ -110,18 +136,18 @@ class VisualNavigator:
         # --- Center Masking (to remove player arrow and static UI) ---
         self.CENTER_MASK_RADIUS_PHASE_CORR = 35
         self.CENTER_MASK_RADIUS_DEFAULT = 60
-        self.CENTER_MASK_RADIUS_MASTER_MAP = 40
+        self.CENTER_MASK_RADIUS_MASTER_MAP = 16  # Reduced by 60% (from 40 to 16) to shrink center void
         self.ARROW_CENTER_MASK_RADIUS = 80
         
         # --- Phase Correlation ---
-        self.PHASE_CORR_CONFIDENCE_THRESHOLD = 0.05
+        # Using shared constant from movement.constants
+        # PHASE_CORR_CONFIDENCE_THRESHOLD imported from constants
         
         # --- Feature Matching Thresholds ---
         self.MIN_INLIERS_FOR_TRACKING = 8
         self.MIN_INLIERS_FOR_RECOVERY = 15
-        self.ARRIVAL_DISTANCE_THRESHOLD = 20
-        self.ARRIVAL_ANGLE_THRESHOLD = 15
-        self.ARRIVAL_BUFFER_SIZE = 5
+        # Using shared constants from movement.constants
+        # ARRIVAL_DISTANCE_THRESHOLD, ARRIVAL_ANGLE_THRESHOLD, ARRIVAL_BUFFER_SIZE imported from constants
         
         # --- Debug Visualization Dimensions ---
         self.DEBUG_CTRL_HEIGHT = 150
@@ -204,6 +230,18 @@ class VisualNavigator:
         self.dx_history = []
         self.dy_history = []
         self.angle_history = []
+        
+        # Phase correlation history (for averaging when offsets are invalid)
+        self.dx_pc_history = []
+        self.dy_pc_history = []
+        self.pc_history_size = 10  # Keep last 10 values for averaging
+        
+        # Decay tracking for averaged values
+        self.consecutive_invalid_count = 0  # Track consecutive invalid readings
+        self.average_decay_factor = 0.95  # Decay factor per invalid reading (5% reduction)
+        
+        # Angle unwrapping - track last angle to prevent flip-flopping
+        self.last_unwrapped_angle = None  # Last unwrapped angle value
         
         # Debugging
         self.debug_window_name = "Visual Odometry"
@@ -462,29 +500,43 @@ class VisualNavigator:
         mask_red = cv2.bitwise_or(mask_red1, mask_red2)
         
         # Detect blue circles (AI team members - blue with white centers)
-        # Blue range
+        # Blue range (expanded)
         lower_blue = np.array(self.CIRCLE_DETECTION_BLUE_LOWER)
         upper_blue = np.array(self.CIRCLE_DETECTION_BLUE_UPPER)
         mask_blue_circles = cv2.inRange(hsv, lower_blue, upper_blue)
         
-        # Also detect white centers (high value, low saturation)
+        # Also detect cyan/light blue (common for teammate indicators)
+        lower_cyan = np.array(self.CIRCLE_DETECTION_CYAN_LOWER)
+        upper_cyan = np.array(self.CIRCLE_DETECTION_CYAN_UPPER)
+        mask_cyan_circles = cv2.inRange(hsv, lower_cyan, upper_cyan)
+        
+        # Also detect white/light centers (high value, low saturation)
         lower_white = np.array(self.CIRCLE_DETECTION_WHITE_LOWER)
         upper_white = np.array(self.CIRCLE_DETECTION_WHITE_UPPER)
         mask_white = cv2.inRange(hsv, lower_white, upper_white)
         
-        # Combine red and blue/white masks
-        mask_circles = cv2.bitwise_or(mask_red, mask_blue_circles)
-        mask_circles = cv2.bitwise_or(mask_circles, mask_white)
+        # Combine all teammate color masks
+        mask_teammate_colors = cv2.bitwise_or(mask_blue_circles, mask_cyan_circles)
+        mask_teammate_colors = cv2.bitwise_or(mask_teammate_colors, mask_white)
+        
+        # Combine red and teammate masks
+        mask_circles = cv2.bitwise_or(mask_red, mask_teammate_colors)
+        
+        # Apply morphological operations to better connect circle pixels
+        # This helps with teammate circles that might have gaps or be partially visible
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask_circles = cv2.morphologyEx(mask_circles, cv2.MORPH_CLOSE, kernel, iterations=1)
+        mask_circles = cv2.morphologyEx(mask_circles, cv2.MORPH_DILATE, kernel, iterations=1)
         
         # Use HoughCircles to detect circular shapes
-        # Apply to the combined mask
+        # Apply to the combined mask with more lenient parameters for teammate detection
         circles = cv2.HoughCircles(
             mask_circles,
             cv2.HOUGH_GRADIENT,
             dp=1,
             minDist=max_radius * 2,
             param1=50,
-            param2=20,
+            param2=13,  # Lowered from 20 to be more sensitive (detect more circles)
             minRadius=min_radius,
             maxRadius=max_radius
         )
@@ -495,27 +547,75 @@ class VisualNavigator:
                 # Draw filled circle on mask to exclude this area
                 cv2.circle(mask, (x, y), r + self.CIRCLE_MASK_PADDING, 0, -1)  # Padding for mask out
         
-        # Alternative: Use contour detection for more robust circle detection
-        # This helps catch circles that HoughCircles might miss
+        # Enhanced contour detection for more robust circle detection
+        # This helps catch circles that HoughCircles might miss, especially teammate circles
         contours, _ = cv2.findContours(mask_circles, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for contour in contours:
             area = cv2.contourArea(contour)
             # Filter by area (roughly circular area for our size range)
-            min_area = np.pi * min_radius * min_radius
-            max_area = np.pi * max_radius * max_radius
+            min_area = np.pi * min_radius * min_radius * 0.5  # Lowered threshold to catch smaller circles
+            max_area = np.pi * max_radius * max_radius * 1.5  # Increased to catch slightly larger circles
             
             if min_area <= area <= max_area:
-                # Check circularity
+                # Check circularity (lowered threshold to be more permissive)
                 perimeter = cv2.arcLength(contour, True)
                 if perimeter > 0:
                     circularity = 4 * np.pi * area / (perimeter * perimeter)
-                    # Circularity of 1.0 is a perfect circle, we accept > 0.7
-                    if circularity > 0.7:
+                    # Circularity of 1.0 is a perfect circle, lowered from 0.7 to 0.6 for teammate circles
+                    if circularity > 0.6:
                         # Get bounding circle
                         (x, y), radius = cv2.minEnclosingCircle(contour)
-                        if min_radius <= radius <= max_radius:
-                            # Mask out this circle
-                            cv2.circle(mask, (int(x), int(y)), int(radius) + self.CIRCLE_MASK_PADDING, 0, -1)
+                        # Expanded radius range to catch more circles
+                        if min_radius * 0.8 <= radius <= max_radius * 1.2:
+                            # Mask out this circle with extra padding for teammate circles
+                            cv2.circle(mask, (int(x), int(y)), int(radius) + self.CIRCLE_MASK_PADDING + 1, 0, -1)
+        
+        # Additional pass: detect circles in grayscale for teammate dots that might not be strongly colored
+        # This catches circles that are visible but might not match the color ranges perfectly
+        # Use adaptive threshold to better detect circles with varying brightness
+        thresh_gray = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                            cv2.THRESH_BINARY_INV, 11, 2)
+        # Apply circular mask to focus on minimap region
+        if hasattr(self, 'mask_stretched') and thresh_gray.shape == self.mask_stretched.shape:
+            thresh_gray = cv2.bitwise_and(thresh_gray, self.mask_stretched)
+        
+        # Apply morphological operations to clean up and connect circle pixels
+        kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+        thresh_gray = cv2.morphologyEx(thresh_gray, cv2.MORPH_CLOSE, kernel_small, iterations=1)
+        
+        # Find contours in grayscale that might be circles
+        contours_gray, _ = cv2.findContours(thresh_gray, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours_gray:
+            area = cv2.contourArea(contour)
+            min_area = np.pi * min_radius * min_radius * 0.5
+            max_area = np.pi * max_radius * max_radius * 1.5
+            
+            if min_area <= area <= max_area:
+                perimeter = cv2.arcLength(contour, True)
+                if perimeter > 0:
+                    circularity = 4 * np.pi * area / (perimeter * perimeter)
+                    # More lenient for grayscale detection, but still require reasonable circularity
+                    if circularity > 0.6:
+                        (x, y), radius = cv2.minEnclosingCircle(contour)
+                        if min_radius * 0.8 <= radius <= max_radius * 1.2:
+                            # Check if this area is already masked (avoid double masking)
+                            center_x, center_y = int(x), int(y)
+                            if 0 <= center_x < w and 0 <= center_y < h:
+                                if mask[center_y, center_x] == 255:  # Not yet masked
+                                    # Additional validation: check if center region matches teammate colors
+                                    # Sample a small region around the center
+                                    y1, y2 = max(0, center_y - 2), min(h, center_y + 3)
+                                    x1, x2 = max(0, center_x - 2), min(w, center_x + 3)
+                                    center_region_hsv = hsv[y1:y2, x1:x2]
+                                    if center_region_hsv.size > 0:
+                                        # Check if any pixels in center region match teammate colors
+                                        mask_blue_check = cv2.inRange(center_region_hsv, lower_blue, upper_blue)
+                                        mask_cyan_check = cv2.inRange(center_region_hsv, lower_cyan, upper_cyan)
+                                        mask_white_check = cv2.inRange(center_region_hsv, lower_white, upper_white)
+                                        if (np.any(mask_blue_check > 0) or np.any(mask_cyan_check > 0) or 
+                                            np.any(mask_white_check > 0)):
+                                            # Likely a teammate circle - mask it out
+                                            cv2.circle(mask, (center_x, center_y), int(radius) + self.CIRCLE_MASK_PADDING, 0, -1)
         
         return mask
 
@@ -676,6 +776,110 @@ class VisualNavigator:
             cv2.putText(canvas, current_text, (chart_right - text_size[0] - 5, chart_top + 15), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
 
+    def _unwrap_angle(self, angle: float, current_img: np.ndarray = None, 
+                     target_arrow_angle: Optional[float] = None) -> float:
+        """
+        Unwrap angle to prevent flip-flopping between positive and negative values.
+        
+        Maintains continuity by detecting wrap-arounds and adjusting angles accordingly.
+        Keeps angles in [-180, 180] range to prevent unbounded accumulation.
+        
+        Optionally uses gold arrow angle and target arrow angle to compute expected angle
+        for validation and correction.
+        
+        Args:
+            angle: Raw angle from homography decomposition (in degrees, range -180 to 180).
+            current_img: Optional current image to extract gold arrow angle for validation.
+            target_arrow_angle: Optional target node arrow angle for validation.
+            
+        Returns:
+            Angle in [-180, 180] range, adjusted to prevent flip-flopping.
+        """
+        # Try to get expected angle from gold arrow if available
+        expected_angle = None
+        if current_img is not None and target_arrow_angle is not None:
+            try:
+                current_minimap = self.extract_minimap(current_img)
+                if current_minimap is not None:
+                    curr_arrow_angle, _ = self.get_gold_arrow_angle(current_minimap)
+                    # Expected angle is the difference between current and target arrow angles
+                    # This represents the rotation needed to align current with target
+                    expected_angle = curr_arrow_angle - target_arrow_angle
+                    # Normalize to [-180, 180]
+                    while expected_angle > 180:
+                        expected_angle -= 360
+                    while expected_angle < -180:
+                        expected_angle += 360
+            except:
+                pass
+        
+        # Always use last_unwrapped_angle as the base reference for continuity
+        if self.last_unwrapped_angle is None:
+            # First reading - initialize with raw angle
+            self.last_unwrapped_angle = angle
+            return angle
+        
+        # Normalize last_unwrapped_angle to [-180, 180] (should already be normalized, but be safe)
+        last_normalized = self.last_unwrapped_angle
+        while last_normalized > 180:
+            last_normalized -= 360
+        while last_normalized < -180:
+            last_normalized += 360
+        
+        # Calculate difference from normalized last angle
+        angle_diff = angle - last_normalized
+        
+        # Normalize difference to [-180, 180] range
+        while angle_diff > 180:
+            angle_diff -= 360
+        while angle_diff < -180:
+            angle_diff += 360
+        
+        # If the difference is large (>90 degrees), it's likely a wrap-around
+        # This happens when angle flips from one side of 180/-180 to the other
+        # Add/subtract 360 to get the closer equivalent angle
+        if abs(angle_diff) > 90:
+            if angle_diff > 0:
+                angle_diff -= 360
+            else:
+                angle_diff += 360
+        
+        # Calculate result: last_normalized + adjusted_diff
+        # This maintains continuity while keeping result in reasonable range
+        result = last_normalized + angle_diff
+        
+        # Normalize result to [-180, 180] to prevent accumulation
+        while result > 180:
+            result -= 360
+        while result < -180:
+            result += 360
+        
+        # Use expected angle from gold arrow for validation/correction if available
+        if expected_angle is not None:
+            # Check difference between result and expected (both normalized)
+            diff_from_expected = result - expected_angle
+            # Normalize difference
+            while diff_from_expected > 180:
+                diff_from_expected -= 360
+            while diff_from_expected < -180:
+                diff_from_expected += 360
+            
+            # Only apply correction if difference is reasonable (45-135 degrees)
+            # This prevents correcting when expected_angle is in a completely different range
+            if 45 < abs(diff_from_expected) < 135:
+                # Blend: 70% expected, 30% result (trust gold arrow more)
+                result = 0.7 * expected_angle + 0.3 * result
+                # Re-normalize after blending
+                while result > 180:
+                    result -= 360
+                while result < -180:
+                    result += 360
+        
+        # Store normalized result (keeps it in [-180, 180] range)
+        self.last_unwrapped_angle = result
+        
+        return result
+    
     def get_gold_arrow_angle(self, image: np.ndarray) -> Tuple[float, Tuple[int, int]]:
         """
         Detects the orientation and centroid of the gold arrow indicator.
@@ -821,15 +1025,66 @@ class VisualNavigator:
         shift, conf = cv2.phaseCorrelate(f_prev, f_curr)
         dx, dy = shift
         
-        if conf < self.PHASE_CORR_CONFIDENCE_THRESHOLD:
+        if conf < PHASE_CORR_CONFIDENCE_THRESHOLD:
             return 0.0, 0.0, conf
+        
+        # Validate dx, dy offsets are realistic
+        # Uses PHASE_CORR_CROP_SIZE (225) crop, but user mentioned 200 for center
+        # If offset is greater than 1/2 that distance (100), it's not realistic
+        max_offset_center = 250  # half of 200 for center crop
+        
+        # If either dx or dy exceeds half the center image width, use average instead
+        if abs(dx) > max_offset_center or abs(dy) > max_offset_center:
+            # Store original invalid values for logging
+            original_dx, original_dy = dx, dy
+            
+            # Invalid transformation - use average of recent values instead
+            if self.dx_pc_history and self.dy_pc_history:
+                # Calculate average of recent history
+                recent_count = min(self.pc_history_size, len(self.dx_pc_history))
+                avg_dx = np.mean(self.dx_pc_history[-recent_count:])
+                avg_dy = np.mean(self.dy_pc_history[-recent_count:])
+                
+                # Apply decay based on consecutive invalid readings
+                # Use a separate counter for PC to track independently
+                if not hasattr(self, 'consecutive_invalid_pc_count'):
+                    self.consecutive_invalid_pc_count = 0
+                self.consecutive_invalid_pc_count += 1
+                decay = self.average_decay_factor ** self.consecutive_invalid_pc_count
+                dx = avg_dx * decay
+                dy = avg_dy * decay
+                
+                print(f"[DRIFT_PC] Invalid offset (dx={original_dx:.1f}, dy={original_dy:.1f}), using decayed average (dx={dx:.1f}, dy={dy:.1f}, decay={decay:.3f}, count={self.consecutive_invalid_pc_count})")
+            else:
+                # No history available - return zeros with low confidence
+                if hasattr(self, 'consecutive_invalid_pc_count'):
+                    self.consecutive_invalid_pc_count = 0  # Reset counter
+                print(f"[DRIFT_PC] Invalid offset (dx={dx:.1f}, dy={dy:.1f}), no history available")
+                return 0.0, 0.0, 0.0
+        else:
+            # Valid reading - reset consecutive invalid count
+            if hasattr(self, 'consecutive_invalid_pc_count'):
+                self.consecutive_invalid_pc_count = 0
+        
+        # Update history with valid values (or averaged values if they were invalid)
+        self.dx_pc_history.append(dx)
+        self.dy_pc_history.append(dy)
+        if len(self.dx_pc_history) > self.pc_history_size:
+            self.dx_pc_history.pop(0)
+            self.dy_pc_history.pop(0)
             
         # Translation is already in world-space (stretched coordinates)
         return dx, dy, conf
 
-    def compute_drift(self, current_img: np.ndarray, target_minimap: np.ndarray) -> Optional[Tuple[float, float, float, int, np.ndarray]]:
+    def compute_drift(self, current_img: np.ndarray, target_minimap: np.ndarray, 
+                     target_arrow_angle: Optional[float] = None) -> Optional[Tuple[float, float, float, int, np.ndarray]]:
         """
         Legacy Feature-Matching drift (ORB). Used for navigation lookahead.
+        
+        Args:
+            current_img: Current screen image.
+            target_minimap: Target minimap image to match against.
+            target_arrow_angle: Optional target node arrow angle for angle validation.
         """
         current_minimap = self.extract_minimap(current_img)
         if current_minimap is None or target_minimap is None:
@@ -876,6 +1131,45 @@ class VisualNavigator:
         inliers_count = int(np.sum(mask)) if mask is not None else 0
         dx, dy, angle = self.vision.feature_matcher.decompose_homography(M)
         
+        # Unwrap angle to prevent flip-flopping between positive and negative
+        # Use gold arrow angle and target arrow angle for validation if available
+        angle = self._unwrap_angle(angle, current_img, target_arrow_angle)
+        
+        # Validate dx, dy offsets are realistic
+        # Image width is 300 for large (circular mask diameter = 2 * MINIMAP_RADIUS = 300)
+        # Image width is 200 for center (used in some contexts)
+        # If offset is greater than 1/2 that distance, it's not realistic and should be treated as lost/junk
+        # Since compute_drift uses the full circular masked region (radius 150, diameter 300),
+        # use half of 300 = 150 as the threshold
+        max_offset_threshold = self.MINIMAP_RADIUS  # 150 (half of 300 diameter for large)
+        
+        # If either dx or dy exceeds half the image width, use average instead
+        if abs(dx) > max_offset_threshold or abs(dy) > max_offset_threshold:
+            # Store original invalid values for logging
+            original_dx, original_dy = dx, dy
+            
+            # Invalid transformation - use average of recent values instead
+            if self.dx_history and self.dy_history:
+                # Calculate average of recent history (use last 10 values if available)
+                recent_count = min(10, len(self.dx_history))
+                avg_dx = np.mean(self.dx_history[-recent_count:])
+                avg_dy = np.mean(self.dy_history[-recent_count:])
+                
+                # Apply decay based on consecutive invalid readings
+                self.consecutive_invalid_count += 1
+                decay = self.average_decay_factor ** self.consecutive_invalid_count
+                dx = avg_dx * decay
+                dy = avg_dy * decay
+                
+                print(f"[DRIFT] Invalid offset (dx={original_dx:.1f}, dy={original_dy:.1f}), using decayed average (dx={dx:.1f}, dy={dy:.1f}, decay={decay:.3f}, count={self.consecutive_invalid_count})")
+            else:
+                # No history available - treat as lost state
+                self.consecutive_invalid_count = 0  # Reset counter
+                return None
+        else:
+            # Valid reading - reset consecutive invalid count
+            self.consecutive_invalid_count = 0
+        
         self.last_dx = dx
         self.last_dy = dy
         self.last_angle = angle
@@ -894,33 +1188,978 @@ class VisualNavigator:
         
         return dx, dy, angle, inliers_count, M
 
-    def generate_master_map(self, nodes: list, landmark_dir: str) -> Optional[np.ndarray]:
+    def _generate_master_map_advanced(self, nodes: list, landmark_dir: str) -> Optional[np.ndarray]:
         """
-        Generates a composite master map from a list of hybrid nodes using North-Aligned SLAM.
-        Stitches minimap images together using recorded world-space translations.
+        Advanced master map generation using SuperPoint + LightGlue + Bundle Adjustment.
+        
+        Uses state-of-the-art stitching pipeline for maximum accuracy.
+        """
+        if not nodes:
+            return None
+        
+        try:
+            from .movement.stitching import (
+                SuperPointExtractor, LightGlueMatcher, 
+                MAGSACEstimator, BundleAdjustment, APAPWarper
+            )
+        except ImportError as e:
+            print(f"[MASTER MAP] Failed to import advanced stitching components: {e}")
+            print("[MASTER MAP] Falling back to legacy method.")
+            return self._generate_master_map_legacy(nodes, landmark_dir)
+        
+        # Check if imports actually succeeded (they might be None if dependencies are missing)
+        if (SuperPointExtractor is None or LightGlueMatcher is None or 
+            MAGSACEstimator is None or BundleAdjustment is None):
+            print("[MASTER MAP] Advanced stitching components not available (missing dependencies).")
+            print("[MASTER MAP] Falling back to legacy method.")
+            print("[MASTER MAP] To use advanced stitching, install: torch, kornia, scipy")
+            return self._generate_master_map_legacy(nodes, landmark_dir)
+        
+        print("[MASTER MAP] Using advanced stitching pipeline...")
+        
+        # 1. Load and preprocess all node images
+        # We need TWO versions:
+        # - Full images for feature extraction (more features = better matching)
+        # - Filtered images for final display (clean visual appearance)
+        node_images_full = []  # Full minimap for feature extraction
+        node_images_filtered = []  # Filtered for display
+        node_angles = []
+        node_pivots = []
+        
+        for node in nodes:
+            path = os.path.join(landmark_dir, node['minimap_path'])
+            if not os.path.exists(path):
+                continue
+            
+            img = cv2.imread(path)
+            if img is None:
+                continue
+            
+            # Stretch if needed
+            h, w = img.shape[:2]
+            if h != self.MINIMAP_STRETCHED_HEIGHT or w != self.MINIMAP_STRETCHED_WIDTH:
+                img = cv2.resize(img, (self.MINIMAP_STRETCHED_WIDTH, self.MINIMAP_STRETCHED_HEIGHT), 
+                               interpolation=cv2.INTER_LINEAR)
+            
+            # Rotate to North
+            arrow_angle = node.get('arrow_angle', 0.0)
+            default_pivot = (self.MINIMAP_CENTER_STRETCHED_X, self.MINIMAP_CENTER_STRETCHED_Y)
+            pivot_stretched = node.get('arrow_pivot', default_pivot)
+            
+            R = cv2.getRotationMatrix2D(pivot_stretched, arrow_angle, 1.0)
+            img_rotated = cv2.warpAffine(img, R, (self.MINIMAP_STRETCHED_WIDTH, self.MINIMAP_STRETCHED_HEIGHT))
+            
+            # Extract circular region
+            crop_y1, crop_y2 = self.CIRCULAR_CROP_Y1, self.CIRCULAR_CROP_Y2
+            img_circle = img_rotated[crop_y1:crop_y2, 0:self.MINIMAP_STRETCHED_WIDTH]
+            
+            # Verify crop size is correct
+            if img_circle.shape[:2] != (self.CIRCULAR_CROP_SIZE, self.CIRCULAR_CROP_SIZE):
+                print(f"[MASTER MAP] WARNING: Circular crop size mismatch! Expected {self.CIRCULAR_CROP_SIZE}x{self.CIRCULAR_CROP_SIZE}, got {img_circle.shape[:2]}")
+                img_circle = cv2.resize(img_circle, (self.CIRCULAR_CROP_SIZE, self.CIRCULAR_CROP_SIZE), interpolation=cv2.INTER_LINEAR)
+            
+            # Create circular mask - center should be at (200, 200) in the 400x400 cropped image
+            # The center in stretched space is (200, 260), after cropping y: 60-460, center becomes (200, 200)
+            # CRITICAL: Use reduced radius to aggressively remove border artifacts
+            circle_mask = np.zeros((self.CIRCULAR_CROP_SIZE, self.CIRCULAR_CROP_SIZE), dtype=np.uint8)
+            cv2.circle(circle_mask, (self.MINIMAP_CENTER_X, self.MINIMAP_CENTER_Y), self.MINIMAP_RADIUS, (255), -1)
+            
+            # Apply mask strictly - zero everything outside circle
+            # This is the FIRST and most important step to remove border artifacts
+            img_north = np.zeros_like(img_circle, dtype=np.uint8)
+            img_north[circle_mask > 0] = img_circle[circle_mask > 0]
+            
+            # Double-check: ensure no border pixels remain
+            outside_mask = (circle_mask == 0)
+            if np.any(outside_mask):
+                num_border_pixels = np.sum(img_north[outside_mask] > 0)
+                if num_border_pixels > 0:
+                    print(f"[MASTER MAP] WARNING: Found {num_border_pixels} border pixels in initial crop for node {i}, zeroing them")
+                    img_north[outside_mask] = 0
+            
+            # Store FULL image for feature extraction (more features available)
+            # CRITICAL: Strictly enforce circular mask to prevent border artifacts from affecting feature matching
+            # Only mask out center (player arrow) and dynamic circles, keep all other features
+            img_full = img_north.copy()
+            # Mask center to remove player arrow
+            center_masked_full = self.mask_center(img_full, radius=self.CENTER_MASK_RADIUS_MASTER_MAP)
+            # Mask dynamic circles (enemies/allies)
+            circle_mask_dyn = self._mask_dynamic_circles(img_full)
+            # Apply both masks
+            img_full = cv2.bitwise_and(center_masked_full, center_masked_full, mask=circle_mask_dyn)
+            # CRITICAL: Strictly enforce circular boundary - zero everything outside circle
+            # This prevents border artifacts from being used in feature extraction
+            img_full_strict = np.zeros_like(img_full, dtype=np.uint8)
+            img_full_strict[circle_mask > 0] = img_full[circle_mask > 0]
+            # One more pass to ensure no border pixels
+            img_full_strict = cv2.bitwise_and(img_full_strict, img_full_strict, mask=circle_mask)
+            node_images_full.append(img_full_strict)
+            
+            # Create filtered version for display (blue paths only)
+            # CRITICAL: Apply circular mask at EVERY step to prevent border artifacts
+            hsv = cv2.cvtColor(img_north, cv2.COLOR_BGR2HSV)
+            lower_blue = np.array(self.blue_lower)
+            upper_blue = np.array(self.blue_upper)
+            mask_blue = cv2.inRange(hsv, lower_blue, upper_blue)
+            circle_mask_dyn = self._mask_dynamic_circles(img_north)
+            
+            # Apply circular mask to color mask BEFORE combining
+            mask_blue = cv2.bitwise_and(mask_blue, mask_blue, mask=circle_mask)
+            combined_mask = cv2.bitwise_and(mask_blue, circle_mask_dyn)
+            combined_mask = cv2.bitwise_and(combined_mask, combined_mask, mask=circle_mask)  # Enforce again
+            color_filtered = cv2.bitwise_and(img_north, img_north, mask=combined_mask)
+            
+            # Edge detection - but mask the result immediately
+            edge_result = self._apply_edge_detection(img_north)
+            edge_result = cv2.bitwise_and(edge_result, edge_result, mask=circle_mask)  # Mask edges
+            
+            color_mask_gray = cv2.cvtColor(color_filtered, cv2.COLOR_BGR2GRAY)
+            color_mask_binary = (color_mask_gray > 0).astype(np.uint8)
+            # Apply circular mask to binary mask BEFORE dilation
+            color_mask_binary = cv2.bitwise_and(color_mask_binary, color_mask_binary, mask=circle_mask)
+            
+            kernel_dilate = np.ones((3, 3), np.uint8)
+            color_mask_dilated = cv2.dilate(color_mask_binary, kernel_dilate, iterations=2)
+            # CRITICAL: Re-apply circular mask after dilation to remove artifacts outside circle
+            color_mask_dilated = cv2.bitwise_and(color_mask_dilated, color_mask_dilated, mask=circle_mask)
+            
+            edge_gray = cv2.cvtColor(edge_result, cv2.COLOR_BGR2GRAY)
+            edge_masked = cv2.bitwise_and(edge_gray, edge_gray, mask=color_mask_dilated)
+            edge_result_filtered = cv2.cvtColor(edge_masked, cv2.COLOR_GRAY2BGR)
+            blue_only = cv2.max(color_filtered, edge_result_filtered)
+            
+            # FINAL: Strictly enforce circular boundary - zero everything outside
+            blue_only_masked = np.zeros_like(blue_only, dtype=np.uint8)
+            blue_only_masked[circle_mask > 0] = blue_only[circle_mask > 0]
+            
+            # One more pass: ensure no pixels outside circle
+            blue_only_masked = cv2.bitwise_and(blue_only_masked, blue_only_masked, mask=circle_mask)
+            
+            node_images_filtered.append(blue_only_masked)
+            
+            node_angles.append(arrow_angle)
+            node_pivots.append(pivot_stretched)
+        
+        if len(node_images_full) == 0:
+            print("[MASTER MAP] No valid node images found.")
+            return None
+        
+        n_nodes = len(node_images_full)
+        print(f"[MASTER MAP] Processing {n_nodes} nodes with advanced stitching...")
+        print(f"[MASTER MAP] Using FULL minimap images for feature extraction (better matching)")
+        
+        # Define fragment size early (used for validation)
+        fragment_size = self.CIRCULAR_CROP_SIZE  # 400x400
+        
+        # 2. Extract features using SuperPoint on FULL images (not filtered)
+        # Full images have more features = better matching accuracy
+        print("[MASTER MAP] Extracting features with SuperPoint from full minimap images...")
+        try:
+            extractor = SuperPointExtractor(n_features=SUPERPOINT_N_FEATURES, device=SUPERPOINT_DEVICE)
+        except (ImportError, RuntimeError, AttributeError) as e:
+            print(f"[MASTER MAP] Failed to initialize SuperPoint: {e}")
+            print("[MASTER MAP] Falling back to legacy method.")
+            return self._generate_master_map_legacy(nodes, landmark_dir)
+        
+        try:
+            # Use FULL images for feature extraction (more features available)
+            # Full images contain all minimap features, not just filtered blue paths
+            # This gives SuperPoint/LightGlue much more information to work with
+            all_features = [extractor.extract(img) for img in node_images_full]
+            feature_counts = [len(f['keypoints']) for f in all_features]
+            print(f"[MASTER MAP] Extracted features from FULL minimap images: {feature_counts} keypoints per node")
+            print(f"[MASTER MAP] Total features: {sum(feature_counts)} (using full images for better matching)")
+        except Exception as e:
+            print(f"[MASTER MAP] Failed to extract features: {e}")
+            print("[MASTER MAP] Falling back to legacy method.")
+            return self._generate_master_map_legacy(nodes, landmark_dir)
+        
+        # 3. Match features using LightGlue
+        print("[MASTER MAP] Matching features with LightGlue...")
+        try:
+            matcher = LightGlueMatcher(filter_threshold=LIGHTGLUE_FILTER_THRESHOLD, device=LIGHTGLUE_DEVICE)
+            all_matches = matcher.match_all_pairs(all_features)
+        except Exception as e:
+            print(f"[MASTER MAP] Failed to match features: {e}")
+            print("[MASTER MAP] Falling back to legacy method.")
+            return self._generate_master_map_legacy(nodes, landmark_dir)
+        
+        # 4. Estimate pairwise transformations using MAGSAC
+        print("[MASTER MAP] Estimating transformations with MAGSAC++...")
+        try:
+            estimator = MAGSACEstimator(
+                method=MAGSAC_METHOD,
+                threshold=MAGSAC_THRESHOLD,
+                confidence=MAGSAC_CONFIDENCE,
+                max_iters=MAGSAC_MAX_ITERS
+            )
+        except Exception as e:
+            print(f"[MASTER MAP] Failed to initialize MAGSAC: {e}")
+            print("[MASTER MAP] Falling back to legacy method.")
+            return self._generate_master_map_legacy(nodes, landmark_dir)
+        
+        pairwise_transforms = {}
+        match_counts = {}
+        for (i, j), match_data in all_matches.items():
+            matches = match_data['matches']
+            
+            # Require more matches for reliability (increased threshold)
+            if len(matches) < 12:  # Increased from 8 to 12
+                print(f"[MASTER MAP] Skipping ({i}->{j}): only {len(matches)} matches (need 12+)")
+                continue
+            
+            # Additional filtering: check match quality
+            # For adjacent nodes, matches should be reasonably distributed
+            kpts_i = all_features[i]['keypoints']
+            kpts_j = all_features[j]['keypoints']
+            
+            # Check if matches are well-distributed (not all clustered)
+            match_kpts_i = kpts_i[matches[:, 0]]
+            match_kpts_j = kpts_j[matches[:, 1]]
+            
+            # Compute spread of matches
+            spread_i = np.std(match_kpts_i, axis=0)
+            spread_j = np.std(match_kpts_j, axis=0)
+            min_spread = min(np.min(spread_i), np.min(spread_j))
+            
+            if min_spread < 20:  # Matches too clustered
+                print(f"[MASTER MAP] Skipping ({i}->{j}): matches too clustered (spread={min_spread:.1f}px)")
+                continue
+            
+            M, inlier_mask, conf = estimator.estimate_from_features(
+                all_features[i], all_features[j], matches
+            )
+            
+            if M is not None and conf > 0.5:
+                n_inliers = np.sum(inlier_mask) if inlier_mask is not None else len(matches)
+                
+                # Validate homography quality
+                kpts_i = all_features[i]['keypoints']
+                kpts_j = all_features[j]['keypoints']
+                inlier_matches = matches[inlier_mask] if inlier_mask is not None else matches
+                
+                # Check reprojection error
+                if len(inlier_matches) > 0:
+                    src_pts = kpts_i[inlier_matches[:, 0]]
+                    dst_pts = kpts_j[inlier_matches[:, 1]]
+                    
+                    # Transform source points
+                    src_pts_hom = np.column_stack([src_pts, np.ones(len(src_pts))])
+                    transformed = (M @ src_pts_hom.T).T
+                    transformed = transformed[:, :2] / transformed[:, 2:3]
+                    
+                    # Compute reprojection errors
+                    errors = np.linalg.norm(transformed - dst_pts, axis=1)
+                    mean_error = np.mean(errors)
+                    max_error = np.max(errors)
+                    median_error = np.median(errors)
+                    
+                    # Reject if reprojection error is too high
+                    if mean_error > 10.0 or median_error > 8.0:
+                        print(f"[MASTER MAP] Rejecting ({i}->{j}): high reprojection error "
+                              f"(mean={mean_error:.1f}, median={median_error:.1f}, max={max_error:.1f})")
+                        continue
+                else:
+                    mean_error = 0.0
+                    median_error = 0.0
+                
+                # Validate transform parameters (images are North-aligned)
+                # For affine transforms, we can directly read rotation and scale
+                rotation_angle = np.degrees(np.arctan2(M[1, 0], M[0, 0]))
+                scale_x = np.sqrt(M[0, 0]**2 + M[1, 0]**2)
+                scale_y = np.sqrt(M[0, 1]**2 + M[1, 1]**2)
+                
+                # For North-aligned images, rotation should be very small (< 2°) and scale very close to 1
+                # Since images are pre-rotated to North, any rotation in the transform is error
+                if abs(rotation_angle) > 2.0:
+                    print(f"[MASTER MAP] Rejecting ({i}->{j}): excessive rotation "
+                          f"(rot={rotation_angle:.1f}°, should be < 2° for North-aligned images)")
+                    continue
+                
+                # Scale should be very close to 1.0 (within 5% tolerance)
+                if abs(scale_x - 1.0) > 0.05 or abs(scale_y - 1.0) > 0.05:
+                    print(f"[MASTER MAP] Rejecting ({i}->{j}): invalid scale "
+                          f"(scale=({scale_x:.3f}, {scale_y:.3f}), should be ~1.0)")
+                    continue
+                
+                # Additional validation: check if translation is reasonable
+                # For affine, translation is directly in [0,2] and [1,2]
+                dx_test = M[0, 2]
+                dy_test = M[1, 2]
+                translation_mag = np.sqrt(dx_test**2 + dy_test**2)
+                
+                # Translation should be reasonable (not more than 2 fragment widths)
+                # For adjacent nodes, translation should typically be < 1 fragment width
+                max_reasonable_translation = fragment_size * 2.0
+                if translation_mag > max_reasonable_translation:
+                    print(f"[MASTER MAP] Rejecting ({i}->{j}): translation too large "
+                          f"({translation_mag:.1f}px, max={max_reasonable_translation:.1f}px)")
+                    continue
+                
+                # For adjacent nodes (i+1 == j), translation should be relatively small
+                if abs(i - j) == 1 and translation_mag > fragment_size * 1.5:
+                    print(f"[MASTER MAP] WARNING: Large translation for adjacent nodes ({i}->{j}): "
+                          f"{translation_mag:.1f}px (expected < {fragment_size * 1.5:.1f}px)")
+                
+                pairwise_transforms[(i, j)] = M
+                match_counts[(i, j)] = n_inliers
+                # Update inliers in match data
+                all_matches[(i, j)]['inliers'] = inlier_mask
+                print(f"[MASTER MAP] Transform ({i}->{j}): {n_inliers} inliers, conf={conf:.3f}, "
+                      f"reproj_error={mean_error:.2f}px, translation=({dx_test:.1f}, {dy_test:.1f}), rot={rotation_angle:.1f}°")
+        
+        if len(pairwise_transforms) == 0:
+            print("[MASTER MAP] ERROR: No valid transformations found from feature matching.")
+            print("[MASTER MAP] Cannot create map without feature matches. Check that nodes have overlapping features.")
+            return None
+        
+        # Check if we have enough transforms to position all nodes
+        # Need at least n-1 transforms for n nodes (spanning tree)
+        min_required = n_nodes - 1
+        if len(pairwise_transforms) < min_required:
+            print(f"[MASTER MAP] WARNING: Only {len(pairwise_transforms)} transforms for {n_nodes} nodes (need {min_required} minimum).")
+            print("[MASTER MAP] Some nodes may not be positioned correctly, but continuing anyway.")
+        
+        print(f"[MASTER MAP] Found {len(pairwise_transforms)} valid pairwise transformations")
+        
+        # 5. Initialize positions using ONLY feature matching transforms
+        # Use least-squares to solve for all positions simultaneously
+        # This minimizes accumulated errors compared to sequential BFS positioning
+        initial_positions = np.zeros((n_nodes, 3))  # [x, y, theta]
+        
+        # Helper function to extract translation from transform matrix
+        def extract_translation_robust(H, src_idx=None, dst_idx=None):
+            """Extract translation from transform matrix (affine or homography)."""
+            # For affine transforms, translation is directly in the matrix
+            # For homography, we need to transform a point
+            # Since we're using affine now, we can read translation directly
+            if H.shape == (3, 3):
+                # Check if it's affine (bottom row is [0, 0, 1])
+                is_affine = np.allclose(H[2, :], [0, 0, 1])
+                
+                if is_affine:
+                    # Affine transform: translation is directly in [0,2] and [1,2]
+                    dx_hom = H[0, 2]
+                    dy_hom = H[1, 2]
+                    # For affine, we can also check consistency by transforming origin
+                    origin_transformed = H @ np.array([[0.0], [0.0], [1.0]])
+                    dx_check = origin_transformed[0, 0] / origin_transformed[2, 0]
+                    dy_check = origin_transformed[1, 0] / origin_transformed[2, 0]
+                    # Should match (within small tolerance)
+                    if abs(dx_hom - dx_check) > 0.1 or abs(dy_hom - dy_check) > 0.1:
+                        print(f"[MASTER MAP] WARNING: Affine translation mismatch: direct=({dx_hom:.1f}, {dy_hom:.1f}), "
+                              f"transformed=({dx_check:.1f}, {dy_check:.1f})")
+                    dx_std = 0.0  # Affine translation is exact
+                    dy_std = 0.0
+                else:
+                    # Full homography: transform reference points
+                    ref_points = np.array([
+                        [self.MINIMAP_CENTER_X, self.MINIMAP_CENTER_Y],  # Center
+                        [self.MINIMAP_CENTER_X + 50, self.MINIMAP_CENTER_Y],  # Right
+                        [self.MINIMAP_CENTER_X, self.MINIMAP_CENTER_Y + 50],  # Down
+                        [self.MINIMAP_CENTER_X - 50, self.MINIMAP_CENTER_Y],  # Left
+                        [self.MINIMAP_CENTER_X, self.MINIMAP_CENTER_Y - 50],  # Up
+                    ], dtype=np.float32)
+                    
+                    translations = []
+                    for pt in ref_points:
+                        pt_homogeneous = np.array([[pt[0], pt[1], 1.0]]).T
+                        transformed = H @ pt_homogeneous
+                        transformed = transformed[:2] / transformed[2]
+                        translations.append(transformed.flatten() - pt)
+                    
+                    translations = np.array(translations)
+                    dx_hom = np.median(translations[:, 0])
+                    dy_hom = np.median(translations[:, 1])
+                    dx_std = np.std(translations[:, 0])
+                    dy_std = np.std(translations[:, 1])
+            else:
+                # Fallback: assume translation is in last column
+                dx_hom = H[0, -1] if H.shape[0] > 0 and H.shape[1] > 0 else 0.0
+                dy_hom = H[1, -1] if H.shape[0] > 1 and H.shape[1] > 0 else 0.0
+                dx_std = 0.0
+                dy_std = 0.0
+            
+            # Method 2: Direct feature match translation (if available)
+            dx_match = None
+            dy_match = None
+            if src_idx is not None and dst_idx is not None and (src_idx, dst_idx) in all_matches:
+                match_data = all_matches[(src_idx, dst_idx)]
+                matches = match_data['matches']
+                inliers = match_data.get('inliers', np.ones(len(matches), dtype=bool))
+                valid_matches = matches[inliers] if inliers is not None else matches
+                
+                if len(valid_matches) > 0:
+                    kpts_src = all_features[src_idx]['keypoints']
+                    kpts_dst = all_features[dst_idx]['keypoints']
+                    
+                    # Compute translation for each inlier match
+                    # Note: These are raw pixel translations in image space
+                    # They may not match homography translation if there's rotation/scale
+                    match_translations = []
+                    for match in valid_matches[:min(50, len(valid_matches))]:  # Use up to 50 matches
+                        idx_src, idx_dst = match
+                        pt_src = kpts_src[idx_src]
+                        pt_dst = kpts_dst[idx_dst]
+                        match_translations.append(pt_dst - pt_src)
+                    
+                    if match_translations:
+                        match_translations = np.array(match_translations)
+                        dx_match = np.median(match_translations[:, 0])
+                        dy_match = np.median(match_translations[:, 1])
+                        match_dy_std = np.std(match_translations[:, 1])
+                        
+                        # Only use match-based if it's significantly different from zero
+                        # and agrees reasonably with homography
+                        match_mag = np.sqrt(dx_match**2 + dy_match**2)
+                        if match_mag < 1.0:  # Too close to zero, likely wrong
+                            dx_match = None
+                            dy_match = None
+            
+            # Method 3: Phase correlation (if images are available)
+            dx_pc = None
+            dy_pc = None
+            pc_conf = 0.0
+            if src_idx is not None and dst_idx is not None:
+                try:
+                    img_src = node_images_full[src_idx]
+                    img_dst = node_images_full[dst_idx]
+                    angle_src = node_angles[src_idx]
+                    angle_dst = node_angles[dst_idx]
+                    pivot_src = node_pivots[src_idx]
+                    pivot_dst = node_pivots[dst_idx]
+                    
+                    # Use phase correlation as cross-validation
+                    dx_pc, dy_pc, pc_conf = self.compute_drift_pc(
+                        img_dst, img_src, angle_dst, pivot_dst, angle_src, pivot_src
+                    )
+                except Exception as e:
+                    pass  # Phase correlation failed, skip it
+            
+            # CRITICAL: Always use transform matrix (affine/homography) as base - it's the most reliable
+            # Other methods are for cross-validation only
+            # Never default to zero - if transform gives zero, that's the actual translation
+            
+            # Choose best translation based on consistency
+            candidates = []
+            # Transform matrix is always available and is our primary method
+            candidates.append(('transform', dx_hom, dy_hom, dy_std))
+            
+            if dx_match is not None:
+                # Only use match-based if it's significantly different and more consistent
+                if abs(dy_match - dy_hom) < 20 and match_dy_std < dy_std * 0.8:
+                    candidates.append(('matches', dx_match, dy_match, match_dy_std if 'match_dy_std' in locals() else dy_std))
+            
+            if dx_pc is not None and pc_conf > 0.5:
+                # Only use phase correlation if it agrees with homography
+                if abs(dy_pc - dy_hom) < 25:  # Must be within 25px of homography
+                    candidates.append(('phase_corr', dx_pc, dy_pc, 0))
+            
+            # Always prefer homography unless another method is clearly better
+            if len(candidates) > 1:
+                # Prefer phase correlation if confidence is very high and it agrees
+                pc_candidate = [c for c in candidates if c[0] == 'phase_corr']
+                if pc_candidate and pc_conf > 0.8 and abs(dy_pc - dy_hom) < 15:
+                    _, dx, dy, _ = pc_candidate[0]
+                    print(f"[MASTER MAP] Using phase correlation for ({src_idx}->{dst_idx}): "
+                          f"dx={dx:.1f}, dy={dy:.1f} (conf={pc_conf:.3f}, agrees with transform)")
+                    return dx, dy
+                
+                # Otherwise, use transform matrix (most reliable)
+                return dx_hom, dy_hom
+            
+            # Default to transform matrix (always available)
+            return dx_hom, dy_hom
+        
+        # Extract all translations first
+        transform_translations = {}
+        y_translations = []  # Track y-translations for validation
+        zero_translation_count = 0
+        for (src, dst), H in pairwise_transforms.items():
+            dx, dy = extract_translation_robust(H, src, dst)
+            translation_mag = np.sqrt(dx**2 + dy**2)
+            
+            # Validate translation is reasonable
+            if translation_mag > 800:  # More than 2 fragment widths seems wrong
+                print(f"[MASTER MAP] WARNING: Large translation ({translation_mag:.1f}px) for ({src}->{dst})")
+                # Don't add to translations if it's suspiciously large
+                continue
+            
+            # Check for suspicious zero translations
+            # Adjacent nodes should have SOME translation (unless they're truly overlapping)
+            if translation_mag < 0.5 and abs(src - dst) == 1:  # Adjacent nodes with zero translation
+                print(f"[MASTER MAP] WARNING: Suspicious zero translation for adjacent nodes ({src}->{dst}), skipping")
+                zero_translation_count += 1
+                continue
+            
+            transform_translations[(src, dst)] = (dx, dy)
+            y_translations.append(dy)
+            print(f"[MASTER MAP] Transform ({src}->{dst}): dx={dx:.1f}, dy={dy:.1f}")
+        
+        if zero_translation_count > 0:
+            print(f"[MASTER MAP] Filtered {zero_translation_count} suspicious zero translations")
+        
+        # Validate y-translations for consistency
+        if y_translations:
+            y_median = np.median(y_translations)
+            y_std = np.std(y_translations)
+            y_mean = np.mean(y_translations)
+            print(f"[MASTER MAP] Y-translation stats: mean={y_mean:.1f}, median={y_median:.1f}, std={y_std:.1f}")
+            if y_std > 100:  # High variance suggests inconsistent transforms
+                print(f"[MASTER MAP] WARNING: High variance in y-translations ({y_std:.1f}), may indicate alignment issues")
+            
+            # Check for systematic bias
+            if abs(y_mean) > 50 and y_std < 50:
+                print(f"[MASTER MAP] WARNING: Systematic y-bias detected (mean={y_mean:.1f}), transforms may have consistent error")
+        
+        # Validate transform consistency (check triangle closure)
+        # Only check transforms that we're actually using for positioning
+        consistency_errors = []
+        transforms_to_check = set(transform_translations.keys())  # Only check transforms we're using
+        for (i, j) in transforms_to_check:
+            for (j2, k) in transforms_to_check:
+                if j == j2 and (i, k) in transforms_to_check:
+                    # We have i->j, j->k, and i->k
+                    H_ij = pairwise_transforms[(i, j)]
+                    H_jk = pairwise_transforms[(j, k)]
+                    H_ik = pairwise_transforms[(i, k)]
+                    
+                    # Compose: H_ik_composed = H_jk @ H_ij
+                    H_ik_composed = H_jk @ H_ij
+                    
+                    # Check translation difference
+                    dx_ij, dy_ij = extract_translation_robust(H_ij)
+                    dx_jk, dy_jk = extract_translation_robust(H_jk)
+                    dx_ik, dy_ik = extract_translation_robust(H_ik)
+                    dx_composed, dy_composed = extract_translation_robust(H_ik_composed)
+                    
+                    error_x = abs(dx_ik - dx_composed)
+                    error_y = abs(dy_ik - dy_composed)
+                    
+                    if error_y > 20:  # Significant y-error
+                        consistency_errors.append((i, j, k, error_x, error_y))
+                        print(f"[MASTER MAP] Consistency check ({i}->{j}->{k}): y-error={error_y:.1f}px")
+        
+        if consistency_errors:
+            print(f"[MASTER MAP] WARNING: Found {len(consistency_errors)} transform consistency issues (may cause vertical misalignment)")
+            
+            # Filter out transforms that are part of inconsistent chains
+            # Count how many errors each transform is involved in
+            transform_error_count = {}
+            for (i, j, k, err_x, err_y) in consistency_errors:
+                transform_error_count[(i, j)] = transform_error_count.get((i, j), 0) + 1
+                transform_error_count[(j, k)] = transform_error_count.get((j, k), 0) + 1
+                transform_error_count[(i, k)] = transform_error_count.get((i, k), 0) + 1
+            
+            # Remove transforms that are involved in many errors
+            # Keep only transforms with 0-1 errors (most are good)
+            max_errors_per_transform = 2
+            filtered_transforms = {}
+            filtered_translations = {}
+            for (src, dst) in transform_translations.keys():
+                error_count = transform_error_count.get((src, dst), 0)
+                if error_count <= max_errors_per_transform:
+                    filtered_transforms[(src, dst)] = pairwise_transforms[(src, dst)]
+                    filtered_translations[(src, dst)] = transform_translations[(src, dst)]
+                else:
+                    print(f"[MASTER MAP] Filtering out inconsistent transform ({src}->{dst}) with {error_count} consistency errors")
+            
+            # Update dictionaries if we filtered anything
+            original_count = len(transform_translations)
+            if len(filtered_transforms) < len(pairwise_transforms):
+                filtered_count = len(filtered_transforms)
+                print(f"[MASTER MAP] Filtered {len(pairwise_transforms) - filtered_count} inconsistent transforms")
+                pairwise_transforms = filtered_transforms
+                transform_translations = filtered_translations
+                
+                # Also update match_counts to match
+                filtered_match_counts = {k: match_counts[k] for k in filtered_transforms.keys() if k in match_counts}
+                match_counts = filtered_match_counts
+                
+                # Check if we still have enough transforms after filtering
+                if len(filtered_transforms) < n_nodes - 1:
+                    print(f"[MASTER MAP] WARNING: After filtering, only {len(filtered_transforms)} transforms remain (need {n_nodes-1} minimum)")
+                    print("[MASTER MAP] Some nodes may not be positioned correctly")
+        
+        # Solve for all positions simultaneously using least-squares
+        # Build system: for each transform (i->j), pos_j = pos_i + translation_ij
+        from scipy.sparse import csr_matrix
+        from scipy.sparse.linalg import lsqr
+        
+        n_constraints = len(transform_translations)
+        if n_constraints > 0:
+            # Build weighted constraint matrix: A * positions = b
+            # Weight each constraint by match quality (inlier count, confidence)
+            A = np.zeros((n_constraints * 2 + 2, n_nodes * 2))  # +2 for anchor
+            b = np.zeros(n_constraints * 2 + 2)
+            weights = np.ones(n_constraints * 2 + 2)  # Weight vector
+            
+            constraint_idx = 0
+            for (src, dst), (dx, dy) in transform_translations.items():
+                # Get match quality metrics for weighting
+                n_inliers = match_counts.get((src, dst), 0)
+                # Weight by inlier count (more inliers = more reliable)
+                weight = min(1.0, n_inliers / 20.0)  # Normalize to 0-1, cap at 20 inliers
+                
+                # X constraint: pos_dst_x - pos_src_x = dx
+                A[constraint_idx * 2, dst * 2] = 1.0
+                A[constraint_idx * 2, src * 2] = -1.0
+                b[constraint_idx * 2] = dx
+                weights[constraint_idx * 2] = weight
+                
+                # Y constraint: pos_dst_y - pos_src_y = dy
+                A[constraint_idx * 2 + 1, dst * 2 + 1] = 1.0
+                A[constraint_idx * 2 + 1, src * 2 + 1] = -1.0
+                b[constraint_idx * 2 + 1] = dy
+                weights[constraint_idx * 2 + 1] = weight
+                
+                constraint_idx += 1
+            
+            # Anchor: node 0 at origin (high weight)
+            A[n_constraints * 2, 0] = 1.0  # x0 = 0
+            A[n_constraints * 2 + 1, 1] = 1.0  # y0 = 0
+            b[n_constraints * 2] = 0.0
+            b[n_constraints * 2 + 1] = 0.0
+            weights[n_constraints * 2] = 10.0  # High weight for anchor
+            weights[n_constraints * 2 + 1] = 10.0
+            
+            # Apply weights: W * A * x = W * b
+            W = np.diag(weights)
+            A_weighted = W @ A
+            b_weighted = W @ b
+            
+            # Solve weighted least-squares
+            try:
+                result = lsqr(A_weighted, b_weighted, atol=1e-6, btol=1e-6)
+                positions_xy = result[0].reshape(n_nodes, 2)
+                
+                # Combine with angles
+                initial_positions = np.column_stack([
+                    positions_xy,
+                    np.array(node_angles)
+                ])
+                
+                # Compute position statistics
+                pos_range_x = positions_xy[:, 0].max() - positions_xy[:, 0].min()
+                pos_range_y = positions_xy[:, 1].max() - positions_xy[:, 1].min()
+                pos_std_x = np.std(positions_xy[:, 0])
+                pos_std_y = np.std(positions_xy[:, 1])
+                
+                print(f"[MASTER MAP] Solved {n_nodes} positions using least-squares from {n_constraints} transforms")
+                print(f"[MASTER MAP] Position range: x=[{positions_xy[:, 0].min():.1f}, {positions_xy[:, 0].max():.1f}] "
+                      f"(span={pos_range_x:.1f}px, std={pos_std_x:.1f}), "
+                      f"y=[{positions_xy[:, 1].min():.1f}, {positions_xy[:, 1].max():.1f}] "
+                      f"(span={pos_range_y:.1f}px, std={pos_std_y:.1f})")
+                
+                # Check if positions seem reasonable
+                if pos_range_x > fragment_size * 10 or pos_range_y > fragment_size * 10:
+                    print(f"[MASTER MAP] WARNING: Very large position range detected! "
+                          f"This may indicate transform errors or misalignment.")
+                if pos_std_x > fragment_size * 3 or pos_std_y > fragment_size * 3:
+                    print(f"[MASTER MAP] WARNING: High position variance detected! "
+                          f"This may indicate inconsistent transforms.")
+            except Exception as e:
+                print(f"[MASTER MAP] Least-squares solve failed: {e}, using BFS fallback")
+                # Fallback to BFS
+                initial_positions[0] = [0.0, 0.0, node_angles[0]]
+                positioned = {0}
+                queue = [0]
+                while queue:
+                    i = queue.pop(0)
+                    for (src, dst) in transform_translations.keys():
+                        if src == i and dst not in positioned:
+                            dx, dy = transform_translations[(src, dst)]
+                            initial_positions[dst] = [
+                                initial_positions[src][0] + dx,
+                                initial_positions[src][1] + dy,
+                                node_angles[dst]
+                            ]
+                            positioned.add(dst)
+                            queue.append(dst)
+                
+                for i in range(n_nodes):
+                    if i not in positioned:
+                        initial_positions[i] = [0.0, 0.0, node_angles[i]]
+                        print(f"[MASTER MAP] WARNING: Node {i} not reachable, positioned at origin")
+        else:
+            print("[MASTER MAP] ERROR: No transforms available for positioning")
+            return None
+        
+        print(f"[MASTER MAP] Initial positions range: x=[{initial_positions[:, 0].min():.1f}, {initial_positions[:, 0].max():.1f}], "
+              f"y=[{initial_positions[:, 1].min():.1f}, {initial_positions[:, 1].max():.1f}]")
+        
+        # Summary statistics
+        print(f"[MASTER MAP] Matching summary:")
+        print(f"  - Total node pairs: {n_nodes * (n_nodes - 1) // 2}")
+        print(f"  - Valid transforms: {len(pairwise_transforms)}")
+        print(f"  - Average inliers per transform: {np.mean(list(match_counts.values())):.1f}")
+        print(f"  - Transform coverage: {len(pairwise_transforms) / max(1, n_nodes - 1) * 100:.1f}% of minimum required")
+        
+        # 6. Bundle Adjustment - use simpler transform-based optimization
+        # Feature-based BA is too complex and error-prone for this use case
+        if n_nodes < 5:
+            print(f"[MASTER MAP] Skipping bundle adjustment for {n_nodes} nodes (too few for reliable optimization)")
+            optimized_positions = initial_positions
+        else:
+            print("[MASTER MAP] Optimizing with Bundle Adjustment (transform-based)...")
+            ba = BundleAdjustment(
+                max_iterations=BUNDLE_ADJUSTMENT_MAX_ITERS,
+                ftol=BUNDLE_ADJUSTMENT_FTOL,
+                xtol=BUNDLE_ADJUSTMENT_XTOL,
+                gtol=BUNDLE_ADJUSTMENT_GTOL
+            )
+            
+            # Use simpler transform-based optimization (more stable)
+            try:
+                optimized_positions = ba.optimize_simple(initial_positions, pairwise_transforms)
+                
+                # Validate optimization didn't make things worse
+                initial_span = np.max(initial_positions[:, :2], axis=0) - np.min(initial_positions[:, :2], axis=0)
+                optimized_span = np.max(optimized_positions[:, :2], axis=0) - np.min(optimized_positions[:, :2], axis=0)
+                
+                # Check if optimization created extreme values, NaN, or excessive expansion
+                if (np.any(np.isnan(optimized_positions)) or 
+                    np.any(np.abs(optimized_positions[:, :2]) > 10000) or
+                    np.any(optimized_span > initial_span * 5) or
+                    np.any(optimized_span < initial_span * 0.1)):  # Also check for collapse
+                    print("[MASTER MAP] Bundle adjustment produced invalid results, using initial positions")
+                    optimized_positions = initial_positions
+                else:
+                    # Check if optimization actually improved (reduced spread or kept it similar)
+                    span_ratio = optimized_span / (initial_span + 1e-6)
+                    if np.all(span_ratio < 3.0) and np.all(span_ratio > 0.3):  # Reasonable bounds
+                        print(f"[MASTER MAP] Optimized positions range: x=[{optimized_positions[:, 0].min():.1f}, {optimized_positions[:, 0].max():.1f}], "
+                              f"y=[{optimized_positions[:, 1].min():.1f}, {optimized_positions[:, 1].max():.1f}]")
+                    else:
+                        print("[MASTER MAP] Bundle adjustment produced unreasonable spread, using initial positions")
+                        optimized_positions = initial_positions
+            except Exception as e:
+                print(f"[MASTER MAP] Bundle adjustment failed: {e}")
+                print("[MASTER MAP] Using initial positions (no optimization)")
+                optimized_positions = initial_positions
+        
+        # 7. Generate master map using optimized positions
+        print("[MASTER MAP] Stitching master map...")
+        # Use full-sized minimap fragments (400x400) instead of cropped
+        # fragment_size already defined earlier
+        fragment_mask = np.zeros((fragment_size, fragment_size), dtype=np.uint8)
+        cv2.circle(fragment_mask, (self.MINIMAP_CENTER_X, self.MINIMAP_CENTER_Y), 
+                  self.MINIMAP_RADIUS, (255), -1)
+        
+        # Determine canvas size based on full fragments
+        pts = optimized_positions[:, :2]  # x, y only
+        min_x, min_y = np.min(pts, axis=0) - fragment_size//2
+        max_x, max_y = np.max(pts, axis=0) + fragment_size//2
+        
+        padding = self.MASTER_MAP_PADDING
+        min_x -= padding
+        min_y -= padding
+        max_x += padding
+        max_y += padding
+        
+        canvas_w = int(max_x - min_x)
+        canvas_h = int(max_y - min_y)
+        # Don't constrain maximum size - use full canvas
+        canvas_w = max(canvas_w, self.MASTER_MAP_MIN_SIZE)
+        canvas_h = max(canvas_h, self.MASTER_MAP_MIN_SIZE)
+        
+        print(f"[MASTER MAP] Canvas size: {canvas_w}x{canvas_h} (fragments: {fragment_size}x{fragment_size})")
+        
+        master_canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+        coverage_map = np.zeros((canvas_h, canvas_w), dtype=np.float32)
+        
+        # Stitch nodes using optimized positions
+        # Use FILTERED images for display (clean visual appearance)
+        centers = []
+        fragment_masks_used = []  # Store masks used for each fragment
+        for i, (img_filtered, node) in enumerate(zip(node_images_filtered, nodes)):
+            # Use full-sized minimap (already North-aligned and filtered)
+            # img_filtered is already 400x400 circular region with blue paths filtered
+            
+            # Verify image size matches expected fragment size
+            if img_filtered.shape[:2] != (fragment_size, fragment_size):
+                print(f"[MASTER MAP] WARNING: Fragment {i} size mismatch! Expected {fragment_size}x{fragment_size}, got {img_filtered.shape[:2]}")
+                # Resize to expected size
+                img_filtered = cv2.resize(img_filtered, (fragment_size, fragment_size), interpolation=cv2.INTER_LINEAR)
+            
+            # CRITICAL: Ensure fragment is properly masked to remove border artifacts
+            # First, mask center artifacts (player arrow area)
+            center_masked = self.mask_center(img_filtered, radius=self.CENTER_MASK_RADIUS_MASTER_MAP)
+            
+            # Verify fragment_mask matches the image size
+            if center_masked.shape[:2] != fragment_mask.shape[:2]:
+                print(f"[MASTER MAP] ERROR: Fragment {i} mask size mismatch! Image: {center_masked.shape[:2]}, Mask: {fragment_mask.shape[:2]}")
+                # This shouldn't happen, but resize mask if needed
+                mask_to_use = cv2.resize(fragment_mask, (center_masked.shape[1], center_masked.shape[0]), interpolation=cv2.INTER_NEAREST)
+            else:
+                mask_to_use = fragment_mask.copy()
+            
+            # Store mask for later use in blending
+            fragment_masks_used.append(mask_to_use)
+            
+            # Apply circular mask STRICTLY - this removes ALL pixels outside the circle
+            # Create fragment with explicit masking: anything outside circle = black
+            final_fragment = np.zeros_like(center_masked, dtype=np.uint8)
+            # Only copy pixels that are inside the circular mask
+            final_fragment[mask_to_use > 0] = center_masked[mask_to_use > 0]
+            
+            # Final verification: ensure no non-zero pixels outside circle
+            outside_mask = (mask_to_use == 0)
+            pixels_outside = np.any(final_fragment[outside_mask] > 0) if np.any(outside_mask) else False
+            if pixels_outside:
+                num_bad_pixels = np.sum(final_fragment[outside_mask] > 0) if np.any(outside_mask) else 0
+                print(f"[MASTER MAP] WARNING: Found {num_bad_pixels} pixels outside circle in fragment {i}, zeroing them")
+                final_fragment[outside_mask] = 0
+            
+            # Placement using optimized coordinates
+            wx, wy = optimized_positions[i, :2]
+            tx = int(wx - min_x - fragment_size//2)
+            ty = int(wy - min_y - fragment_size//2)
+            
+            # Place fragment with blending (same as legacy method)
+            tx_clipped = max(0, min(tx, canvas_w - 1))
+            ty_clipped = max(0, min(ty, canvas_h - 1))
+            tx_end = min(tx + fragment_size, canvas_w)
+            ty_end = min(ty + fragment_size, canvas_h)
+            
+            frag_h = ty_end - ty_clipped
+            frag_w = tx_end - tx_clipped
+            
+            if frag_h > 0 and frag_w > 0:
+                frag_y1 = ty_clipped - ty
+                frag_y2 = frag_y1 + frag_h
+                frag_x1 = tx_clipped - tx
+                frag_x2 = frag_x1 + frag_w
+                
+                visible_fragment = final_fragment[frag_y1:frag_y2, frag_x1:frag_x2]
+
+                # Extract the corresponding portion of the circular mask
+                # Use the mask that was stored for this fragment
+                mask_for_fragment = fragment_masks_used[i]
+                frag_mask_portion = mask_for_fragment[frag_y1:frag_y2, frag_x1:frag_x2]
+                within_circle = (frag_mask_portion > 0).astype(np.float32)
+                
+                # CRITICAL: Strictly enforce mask on visible fragment - zero any pixels outside circle
+                # This prevents border artifacts from being blended into the final map
+                outside_circle_mask = (frag_mask_portion == 0)
+                if np.any(outside_circle_mask):
+                    visible_fragment[outside_circle_mask] = 0
+                
+                # Distance-based weights (for blending multiple overlapping fragments)
+                # Use actual circular center relative to fragment origin
+                actual_center_x = self.MINIMAP_CENTER_X - frag_x1
+                actual_center_y = self.MINIMAP_CENTER_Y - frag_y1
+                y_coords, x_coords = np.ogrid[0:frag_h, 0:frag_w]
+                center_dist = np.sqrt((x_coords - actual_center_x)**2 + (y_coords - actual_center_y)**2)
+                max_dist = self.MINIMAP_RADIUS
+                if max_dist > 0:
+                    weights = np.maximum(0, 1.0 - center_dist / max_dist)
+                else:
+                    weights = np.ones((frag_h, frag_w), dtype=np.float32)
+                
+                # CRITICAL: Weights must be zero outside the circle
+                weights = weights * within_circle
+                
+                region = master_canvas[ty_clipped:ty_end, tx_clipped:tx_end]
+                region_coverage = coverage_map[ty_clipped:ty_end, tx_clipped:tx_end]
+                
+                # Create mask: fragment has content AND is within circular mask
+                has_content = (visible_fragment.sum(axis=2) > 0).astype(np.float32)
+                mask = has_content * within_circle  # Both conditions must be true
+                
+                # Final weights: distance-based blending, but only within circle
+                new_weights = weights * mask
+                
+                total_weights = region_coverage + new_weights
+                total_weights = np.maximum(total_weights, 1e-6)
+                
+                for c in range(3):
+                    region_channel = region[:, :, c].astype(np.float32)
+                    frag_channel = visible_fragment[:, :, c].astype(np.float32)
+                    blended_channel = (region_channel * region_coverage + frag_channel * new_weights) / total_weights
+                    region[:, :, c] = blended_channel.astype(np.uint8)
+                
+                coverage_map[ty_clipped:ty_end, tx_clipped:tx_end] = total_weights
+            
+            centers.append((int(wx - min_x), int(wy - min_y)))
+        
+        # Draw breadcrumbs
+        if len(centers) > 1:
+            for i in range(len(centers) - 1):
+                cv2.line(master_canvas, centers[i], centers[i+1], self.COLOR_ORANGE, 2)
+            cv2.circle(master_canvas, centers[0], 8, self.COLOR_GREEN, -1)
+            cv2.circle(master_canvas, centers[-1], 8, self.COLOR_RED, -1)
+        
+        # Find bounding box of actual content (non-black regions)
+        # Crop to actual content to remove large black borders
+        gray = cv2.cvtColor(master_canvas, cv2.COLOR_BGR2GRAY)
+        non_zero = np.where(gray > 0)
+        if len(non_zero[0]) > 0:
+            min_y, max_y = non_zero[0].min(), non_zero[0].max()
+            min_x, max_x = non_zero[1].min(), non_zero[1].max()
+            content_bbox = (min_x, min_y, max_x - min_x, max_y - min_y)
+            print(f"[MASTER MAP] Content bounding box: x={min_x}, y={min_y}, w={max_x-min_x}, h={max_y-min_y}")
+            print(f"[MASTER MAP] Canvas size: {canvas_w}x{canvas_h}")
+            
+            # Crop to content with small padding to avoid edge artifacts
+            crop_padding = 10
+            crop_x1 = max(0, min_x - crop_padding)
+            crop_y1 = max(0, min_y - crop_padding)
+            crop_x2 = min(canvas_w, max_x + crop_padding)
+            crop_y2 = min(canvas_h, max_y + crop_padding)
+            
+            master_canvas = master_canvas[crop_y1:crop_y2, crop_x1:crop_x2]
+            print(f"[MASTER MAP] Cropped to content: {crop_x2-crop_x1}x{crop_y2-crop_y1} (removed {canvas_w-(crop_x2-crop_x1)}x{canvas_h-(crop_y2-crop_y1)} black borders)")
+        else:
+            print("[MASTER MAP] WARNING: No content found in canvas!")
+        
+        print("[MASTER MAP] Advanced stitching complete.")
+        return master_canvas
+    
+    def _generate_master_map_legacy(self, nodes: list, landmark_dir: str) -> Optional[np.ndarray]:
+        """
+        Legacy master map generation using cumulative coordinates.
+        
+        This is the original implementation kept for backward compatibility.
         """
         if not nodes:
             return None
 
-        # 1. Calculate Cumulative World Coordinates (North-Up Frame)
+        # 1. Calculate Cumulative World Coordinates (North-Up Frame) with missing offset handling
         world_coords = [(0.0, 0.0)]
         curr_x, curr_y = 0.0, 0.0
+        missing_count = 0
         
         for i in range(1, len(nodes)):
             offset = nodes[i].get('relative_offset')
-            if offset:
+            if offset and offset.get('dx') is not None and offset.get('dy') is not None:
                 dx, dy = offset['dx'], offset['dy']
                 curr_x += dx
                 curr_y += dy
+                missing_count = 0  # Reset counter on valid offset
+            else:
+                # Missing offset - use zero (position doesn't advance)
+                missing_count += 1
+                if missing_count > 3:
+                    print(f"[MASTER MAP] Warning: Multiple consecutive missing offsets at node {i}")
             world_coords.append((curr_x, curr_y))
 
-        # 2. Determine Canvas Size
+        # 2. Validate coordinate system
+        pts = np.array(world_coords)
+        if len(pts) > 0:
+            print(f"[MASTER MAP] Coordinate range: x=[{pts[:, 0].min():.1f}, {pts[:, 0].max():.1f}], "
+                  f"y=[{pts[:, 1].min():.1f}, {pts[:, 1].max():.1f}]")
+            
+            # Check for NaN or extreme values
+            if np.any(np.isnan(pts)) or np.any(np.abs(pts) > 100000):
+                print("[MASTER MAP] Warning: Invalid coordinates detected!")
+
+        # 3. Determine Canvas Size
         crop_size = self.MASTER_MAP_CROP_SIZE
         
         crop_mask = np.zeros((crop_size, crop_size), dtype=np.uint8)
         cv2.circle(crop_mask, (crop_size//2, crop_size//2), crop_size//2 - self.MASTER_MAP_CIRCLE_BORDER, (255), -1)
 
-        pts = np.array(world_coords)
         min_x, min_y = np.min(pts, axis=0) - crop_size//2
         max_x, max_y = np.max(pts, axis=0) + crop_size//2
 
@@ -936,7 +2175,10 @@ class VisualNavigator:
 
         master_canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
         
-        # 3. Stitch North-Aligned Nodes
+        # Create coverage tracking for alpha blending
+        coverage_map = np.zeros((canvas_h, canvas_w), dtype=np.float32)
+        
+        # 4. Stitch North-Aligned Nodes
         centers = []
         for i, node in enumerate(nodes):
             path = os.path.join(landmark_dir, node['minimap_path'])
@@ -952,25 +2194,77 @@ class VisualNavigator:
                 # Assume it's 400x400 raw, stretch to 400x520
                 img = cv2.resize(img, (self.MINIMAP_STRETCHED_WIDTH, self.MINIMAP_STRETCHED_HEIGHT), interpolation=cv2.INTER_LINEAR)
             
-            # Step 2: Crop 400x400 circle from stretched image (including border)
+            # Step 2: Rotate stretched image to North BEFORE cropping (same as compute_drift_pc)
+            # This ensures proper alignment - rotation must happen on full stretched image
+            arrow_angle = node.get('arrow_angle', 0.0)
+            # Get pivot in stretched space (arrow_pivot is stored in stretched coordinates)
+            default_pivot = (self.MINIMAP_CENTER_STRETCHED_X, self.MINIMAP_CENTER_STRETCHED_Y)  # (200, 260)
+            pivot_stretched = node.get('arrow_pivot', default_pivot)
+            
+            # Rotate to align to North (same approach as compute_drift_pc)
+            # In compute_drift_pc, rotation is applied by arrow_angle directly
+            # arrow_angle is the angle the arrow is pointing (0=Up/North, positive=CW)
+            # OpenCV's getRotationMatrix2D rotates counter-clockwise for positive angles
+            # To align to North, we rotate CCW by arrow_angle (same as compute_drift_pc)
+            R = cv2.getRotationMatrix2D(pivot_stretched, arrow_angle, 1.0)
+            img_rotated = cv2.warpAffine(img, R, (self.MINIMAP_STRETCHED_WIDTH, self.MINIMAP_STRETCHED_HEIGHT))
+            
+            # Step 3: Crop 400x400 circle from rotated stretched image
             # Extract region centered at (200, 260): x=0-400, y=60-460
             crop_y1, crop_y2 = self.CIRCULAR_CROP_Y1, self.CIRCULAR_CROP_Y2
-            img_circle = img[crop_y1:crop_y2, 0:self.MINIMAP_STRETCHED_WIDTH]
+            img_circle = img_rotated[crop_y1:crop_y2, 0:self.MINIMAP_STRETCHED_WIDTH]
             
             # Apply circular mask to the 400x400 region
             circle_mask = np.zeros((self.CIRCULAR_CROP_SIZE, self.CIRCULAR_CROP_SIZE), dtype=np.uint8)
             cv2.circle(circle_mask, (self.MINIMAP_CENTER_X, self.MINIMAP_CENTER_Y), self.MINIMAP_RADIUS, (255), -1)
-            img_circle = cv2.bitwise_and(img_circle, img_circle, mask=circle_mask)
+            img_north = cv2.bitwise_and(img_circle, img_circle, mask=circle_mask)
             
-            # Step 3: Rotate the 400x400 circle to North
-            arrow_angle = node.get('arrow_angle', 0.0)
-            pivot = node.get('arrow_pivot', self.minimap_center_stretched)
-            # Pivot in 400x400 crop space: (200, 200) - the center of the circle
-            R = cv2.getRotationMatrix2D((self.MINIMAP_CENTER_X, self.MINIMAP_CENTER_Y), arrow_angle, 1.0)
-            img_north = cv2.warpAffine(img_circle, R, (self.CIRCULAR_CROP_SIZE, self.CIRCULAR_CROP_SIZE))
+            # Step 4: Apply filtering for master map - only blue/cyan paths, exclude gold and red/alert
+            # Gold is the player arrow (transient), red/alert is enemy state (transient)
+            # For master map, we only want the permanent blue/cyan path features
+            hsv = cv2.cvtColor(img_north, cv2.COLOR_BGR2HSV)
             
-            # Step 4: Filter blue outlines
-            blue_only = self._filter_blue_colors(img_north, include_gold=False)
+            # Only use blue/cyan range (exclude gold and red/alert)
+            lower_blue = np.array(self.blue_lower)
+            upper_blue = np.array(self.blue_upper)
+            mask_blue = cv2.inRange(hsv, lower_blue, upper_blue)
+            
+            # Apply dynamic circle masking to remove enemy dots and AI team circles
+            circle_mask = self._mask_dynamic_circles(img_north)
+            combined_mask = cv2.bitwise_and(mask_blue, circle_mask)
+            color_filtered = cv2.bitwise_and(img_north, img_north, mask=combined_mask)
+            
+            # Get edge detection result
+            edge_result = self._apply_edge_detection(img_north)
+            
+            # Filter edges to only keep those near color-filtered regions (removes gridlines)
+            # This ensures we only keep edges that correspond to actual map features, not UI gridlines
+            color_mask_gray = cv2.cvtColor(color_filtered, cv2.COLOR_BGR2GRAY)
+            color_mask_binary = (color_mask_gray > 0).astype(np.uint8)
+            # Dilate the color mask slightly to include edges near color features
+            kernel_dilate = np.ones((3, 3), np.uint8)
+            color_mask_dilated = cv2.dilate(color_mask_binary, kernel_dilate, iterations=2)
+            # Only keep edges that are near color-filtered regions
+            edge_gray = cv2.cvtColor(edge_result, cv2.COLOR_BGR2GRAY)
+            edge_masked = cv2.bitwise_and(edge_gray, edge_gray, mask=color_mask_dilated)
+            edge_result_filtered = cv2.cvtColor(edge_masked, cv2.COLOR_GRAY2BGR)
+            
+            # Combine color filter and filtered edge detection (same as route following)
+            blue_only = cv2.max(color_filtered, edge_result_filtered)
+            
+            # Apply morphological operations to clean up noise while preserving colors
+            # Create a binary mask from non-black pixels (where we have filtered content)
+            gray_mask = cv2.cvtColor(blue_only, cv2.COLOR_BGR2GRAY)
+            binary_mask = (gray_mask > 0).astype(np.uint8) * 255
+            
+            # Clean up the mask: remove small noise, fill small gaps
+            kernel_small = np.ones((2, 2), np.uint8)
+            binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel_small, iterations=1)
+            kernel_close = np.ones((3, 3), np.uint8)
+            binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel_close, iterations=1)
+            
+            # Apply cleaned mask to preserve colors while removing noise
+            blue_only = cv2.bitwise_and(blue_only, blue_only, mask=binary_mask)
             
             # Step 5: Crop MASTER_MAP_CROP_SIZE subsection around center
             crop_x1, crop_y1 = self.MINIMAP_CENTER_X - crop_size//2, self.MINIMAP_CENTER_Y - crop_size//2
@@ -986,21 +2280,304 @@ class VisualNavigator:
             tx = int(wx - min_x - crop_size//2)
             ty = int(wy - min_y - crop_size//2)
             
-            # Composite
-            if 0 <= tx < canvas_w - crop_size and 0 <= ty < canvas_h - crop_size:
-                region = master_canvas[ty:ty+crop_size, tx:tx+crop_size]
-                master_canvas[ty:ty+crop_size, tx:tx+crop_size] = cv2.max(region, final_fragment)
+            # Allow partial placement near boundaries
+            tx_clipped = max(0, min(tx, canvas_w - 1))
+            ty_clipped = max(0, min(ty, canvas_h - 1))
+            tx_end = min(tx + crop_size, canvas_w)
+            ty_end = min(ty + crop_size, canvas_h)
+            
+            frag_h = ty_end - ty_clipped
+            frag_w = tx_end - tx_clipped
+            
+            if frag_h > 0 and frag_w > 0:
+                # Extract visible portion of fragment
+                frag_y1 = ty_clipped - ty
+                frag_y2 = frag_y1 + frag_h
+                frag_x1 = tx_clipped - tx
+                frag_x2 = frag_x1 + frag_w
+                
+                visible_fragment = final_fragment[frag_y1:frag_y2, frag_x1:frag_x2]
+                
+                # Create distance-based weight (higher weight near center)
+                y_coords, x_coords = np.ogrid[0:frag_h, 0:frag_w]
+                # Calculate distance from fragment center (accounting for clipping)
+                frag_center_x = frag_w // 2
+                frag_center_y = frag_h // 2
+                center_dist = np.sqrt((x_coords - frag_center_x)**2 + (y_coords - frag_center_y)**2)
+                max_dist = min(frag_w, frag_h) // 2
+                if max_dist > 0:
+                    weights = np.maximum(0, 1.0 - center_dist / max_dist)
+                else:
+                    weights = np.ones((frag_h, frag_w), dtype=np.float32)
+                
+                # Extract region
+                region = master_canvas[ty_clipped:ty_end, tx_clipped:tx_end]
+                region_coverage = coverage_map[ty_clipped:ty_end, tx_clipped:tx_end]
+                
+                # Create mask for non-zero pixels in fragment
+                mask = (visible_fragment.sum(axis=2) > 0).astype(np.float32)
+                new_weights = weights * mask
+                
+                # Blend: weighted average where both exist, direct placement where empty
+                total_weights = region_coverage + new_weights
+                total_weights = np.maximum(total_weights, 1e-6)  # Avoid division by zero
+                
+                # Weighted blend for each channel
+                for c in range(3):
+                    region_channel = region[:, :, c].astype(np.float32)
+                    frag_channel = visible_fragment[:, :, c].astype(np.float32)
+                    blended_channel = (region_channel * region_coverage + frag_channel * new_weights) / total_weights
+                    region[:, :, c] = blended_channel.astype(np.uint8)
+                
+                # Update coverage
+                coverage_map[ty_clipped:ty_end, tx_clipped:tx_end] = total_weights
             
             centers.append((int(wx - min_x), int(wy - min_y)))
 
-        # 4. Draw Breadcrumbs
+        # 5. Draw Breadcrumbs
         if len(centers) > 1:
             for i in range(len(centers) - 1):
                 cv2.line(master_canvas, centers[i], centers[i+1], self.COLOR_ORANGE, 2)
             cv2.circle(master_canvas, centers[0], 8, self.COLOR_GREEN, -1)  # Start
             cv2.circle(master_canvas, centers[-1], 8, self.COLOR_RED, -1)  # End
         
-        # 5. Downsample
+        # 6. Downsample
+        final_map = cv2.resize(master_canvas, (0, 0), fx=self.MASTER_MAP_DOWNSAMPLE_FACTOR, fy=self.MASTER_MAP_DOWNSAMPLE_FACTOR, interpolation=cv2.INTER_AREA)
+        return final_map
+
+    def generate_master_map(self, nodes: list, landmark_dir: str) -> Optional[np.ndarray]:
+        """
+        Generates a composite master map from a list of hybrid nodes using North-Aligned SLAM.
+        Stitches minimap images together using recorded world-space translations.
+        
+        Uses advanced stitching pipeline (SuperPoint + LightGlue + Bundle Adjustment) if enabled,
+        otherwise falls back to legacy cumulative coordinate method.
+        """
+        if not nodes:
+            return None
+        
+        if ENABLE_ADVANCED_STITCHING:
+            return self._generate_master_map_advanced(nodes, landmark_dir)
+        else:
+            return self._generate_master_map_legacy(nodes, landmark_dir)
+
+        # 1. Calculate Cumulative World Coordinates (North-Up Frame) with missing offset handling
+        world_coords = [(0.0, 0.0)]
+        curr_x, curr_y = 0.0, 0.0
+        missing_count = 0
+        
+        for i in range(1, len(nodes)):
+            offset = nodes[i].get('relative_offset')
+            if offset and offset.get('dx') is not None and offset.get('dy') is not None:
+                dx, dy = offset['dx'], offset['dy']
+                curr_x += dx
+                curr_y += dy
+                missing_count = 0  # Reset counter on valid offset
+            else:
+                # Missing offset - use zero (position doesn't advance)
+                missing_count += 1
+                if missing_count > 3:
+                    print(f"[MASTER MAP] Warning: Multiple consecutive missing offsets at node {i}")
+            world_coords.append((curr_x, curr_y))
+
+        # 2. Validate coordinate system
+        pts = np.array(world_coords)
+        if len(pts) > 0:
+            print(f"[MASTER MAP] Coordinate range: x=[{pts[:, 0].min():.1f}, {pts[:, 0].max():.1f}], "
+                  f"y=[{pts[:, 1].min():.1f}, {pts[:, 1].max():.1f}]")
+            
+            # Check for NaN or extreme values
+            if np.any(np.isnan(pts)) or np.any(np.abs(pts) > 100000):
+                print("[MASTER MAP] Warning: Invalid coordinates detected!")
+
+        # 3. Determine Canvas Size
+        crop_size = self.MASTER_MAP_CROP_SIZE
+        
+        crop_mask = np.zeros((crop_size, crop_size), dtype=np.uint8)
+        cv2.circle(crop_mask, (crop_size//2, crop_size//2), crop_size//2 - self.MASTER_MAP_CIRCLE_BORDER, (255), -1)
+
+        min_x, min_y = np.min(pts, axis=0) - crop_size//2
+        max_x, max_y = np.max(pts, axis=0) + crop_size//2
+
+        padding = self.MASTER_MAP_PADDING
+        min_x -= padding; min_y -= padding
+        max_x += padding; max_y += padding
+        
+        canvas_w = int(max_x - min_x)
+        canvas_h = int(max_y - min_y)
+        
+        canvas_w = min(max(canvas_w, self.MASTER_MAP_MIN_SIZE), self.MASTER_MAP_MAX_SIZE)
+        canvas_h = min(max(canvas_h, self.MASTER_MAP_MIN_SIZE), self.MASTER_MAP_MAX_SIZE)
+
+        master_canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+        
+        # Create coverage tracking for alpha blending
+        coverage_map = np.zeros((canvas_h, canvas_w), dtype=np.float32)
+        
+        # 4. Stitch North-Aligned Nodes
+        centers = []
+        for i, node in enumerate(nodes):
+            path = os.path.join(landmark_dir, node['minimap_path'])
+            if not os.path.exists(path): continue
+                
+            img = cv2.imread(path)
+            if img is None: continue
+            
+            # Step 1: Stretch (if not already stretched)
+            # NOTE: Images should already be stretched from recording, but handle legacy unstretched images
+            h, w = img.shape[:2]
+            if h != self.MINIMAP_STRETCHED_HEIGHT or w != self.MINIMAP_STRETCHED_WIDTH:
+                # Assume it's 400x400 raw, stretch to 400x520
+                img = cv2.resize(img, (self.MINIMAP_STRETCHED_WIDTH, self.MINIMAP_STRETCHED_HEIGHT), interpolation=cv2.INTER_LINEAR)
+            
+            # Step 2: Rotate stretched image to North BEFORE cropping (same as compute_drift_pc)
+            # This ensures proper alignment - rotation must happen on full stretched image
+            arrow_angle = node.get('arrow_angle', 0.0)
+            # Get pivot in stretched space (arrow_pivot is stored in stretched coordinates)
+            default_pivot = (self.MINIMAP_CENTER_STRETCHED_X, self.MINIMAP_CENTER_STRETCHED_Y)  # (200, 260)
+            pivot_stretched = node.get('arrow_pivot', default_pivot)
+            
+            # Rotate to align to North (same approach as compute_drift_pc)
+            # In compute_drift_pc, rotation is applied by arrow_angle directly
+            # arrow_angle is the angle the arrow is pointing (0=Up/North, positive=CW)
+            # OpenCV's getRotationMatrix2D rotates counter-clockwise for positive angles
+            # To align to North, we rotate CCW by arrow_angle (same as compute_drift_pc)
+            R = cv2.getRotationMatrix2D(pivot_stretched, arrow_angle, 1.0)
+            img_rotated = cv2.warpAffine(img, R, (self.MINIMAP_STRETCHED_WIDTH, self.MINIMAP_STRETCHED_HEIGHT))
+            
+            # Step 3: Crop 400x400 circle from rotated stretched image
+            # Extract region centered at (200, 260): x=0-400, y=60-460
+            crop_y1, crop_y2 = self.CIRCULAR_CROP_Y1, self.CIRCULAR_CROP_Y2
+            img_circle = img_rotated[crop_y1:crop_y2, 0:self.MINIMAP_STRETCHED_WIDTH]
+            
+            # Apply circular mask to the 400x400 region
+            circle_mask = np.zeros((self.CIRCULAR_CROP_SIZE, self.CIRCULAR_CROP_SIZE), dtype=np.uint8)
+            cv2.circle(circle_mask, (self.MINIMAP_CENTER_X, self.MINIMAP_CENTER_Y), self.MINIMAP_RADIUS, (255), -1)
+            img_north = cv2.bitwise_and(img_circle, img_circle, mask=circle_mask)
+            
+            # Step 4: Apply filtering for master map - only blue/cyan paths, exclude gold and red/alert
+            # Gold is the player arrow (transient), red/alert is enemy state (transient)
+            # For master map, we only want the permanent blue/cyan path features
+            hsv = cv2.cvtColor(img_north, cv2.COLOR_BGR2HSV)
+            
+            # Only use blue/cyan range (exclude gold and red/alert)
+            lower_blue = np.array(self.blue_lower)
+            upper_blue = np.array(self.blue_upper)
+            mask_blue = cv2.inRange(hsv, lower_blue, upper_blue)
+            
+            # Apply dynamic circle masking to remove enemy dots and AI team circles
+            circle_mask = self._mask_dynamic_circles(img_north)
+            combined_mask = cv2.bitwise_and(mask_blue, circle_mask)
+            color_filtered = cv2.bitwise_and(img_north, img_north, mask=combined_mask)
+            
+            # Get edge detection result
+            edge_result = self._apply_edge_detection(img_north)
+            
+            # Filter edges to only keep those near color-filtered regions (removes gridlines)
+            # This ensures we only keep edges that correspond to actual map features, not UI gridlines
+            color_mask_gray = cv2.cvtColor(color_filtered, cv2.COLOR_BGR2GRAY)
+            color_mask_binary = (color_mask_gray > 0).astype(np.uint8)
+            # Dilate the color mask slightly to include edges near color features
+            kernel_dilate = np.ones((3, 3), np.uint8)
+            color_mask_dilated = cv2.dilate(color_mask_binary, kernel_dilate, iterations=2)
+            # Only keep edges that are near color-filtered regions
+            edge_gray = cv2.cvtColor(edge_result, cv2.COLOR_BGR2GRAY)
+            edge_masked = cv2.bitwise_and(edge_gray, edge_gray, mask=color_mask_dilated)
+            edge_result_filtered = cv2.cvtColor(edge_masked, cv2.COLOR_GRAY2BGR)
+            
+            # Combine color filter and filtered edge detection (same as route following)
+            blue_only = cv2.max(color_filtered, edge_result_filtered)
+            
+            # Apply morphological operations to clean up noise while preserving colors
+            # Create a binary mask from non-black pixels (where we have filtered content)
+            gray_mask = cv2.cvtColor(blue_only, cv2.COLOR_BGR2GRAY)
+            binary_mask = (gray_mask > 0).astype(np.uint8) * 255
+            
+            # Clean up the mask: remove small noise, fill small gaps
+            kernel_small = np.ones((2, 2), np.uint8)
+            binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel_small, iterations=1)
+            kernel_close = np.ones((3, 3), np.uint8)
+            binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel_close, iterations=1)
+            
+            # Apply cleaned mask to preserve colors while removing noise
+            blue_only = cv2.bitwise_and(blue_only, blue_only, mask=binary_mask)
+            
+            # Step 5: Crop MASTER_MAP_CROP_SIZE subsection around center
+            crop_x1, crop_y1 = self.MINIMAP_CENTER_X - crop_size//2, self.MINIMAP_CENTER_Y - crop_size//2
+            crop_x2, crop_y2 = self.MINIMAP_CENTER_X + crop_size//2, self.MINIMAP_CENTER_Y + crop_size//2
+            cropped = blue_only[crop_y1:crop_y2, crop_x1:crop_x2]
+            
+            # Mask out center artifacts
+            center_masked_crop = self.mask_center(cropped, radius=self.CENTER_MASK_RADIUS_MASTER_MAP)
+            final_fragment = cv2.bitwise_and(center_masked_crop, center_masked_crop, mask=crop_mask)
+            
+            # Placement in Canvas
+            wx, wy = world_coords[i]
+            tx = int(wx - min_x - crop_size//2)
+            ty = int(wy - min_y - crop_size//2)
+            
+            # Allow partial placement near boundaries
+            tx_clipped = max(0, min(tx, canvas_w - 1))
+            ty_clipped = max(0, min(ty, canvas_h - 1))
+            tx_end = min(tx + crop_size, canvas_w)
+            ty_end = min(ty + crop_size, canvas_h)
+            
+            frag_h = ty_end - ty_clipped
+            frag_w = tx_end - tx_clipped
+            
+            if frag_h > 0 and frag_w > 0:
+                # Extract visible portion of fragment
+                frag_y1 = ty_clipped - ty
+                frag_y2 = frag_y1 + frag_h
+                frag_x1 = tx_clipped - tx
+                frag_x2 = frag_x1 + frag_w
+                
+                visible_fragment = final_fragment[frag_y1:frag_y2, frag_x1:frag_x2]
+                
+                # Create distance-based weight (higher weight near center)
+                y_coords, x_coords = np.ogrid[0:frag_h, 0:frag_w]
+                # Calculate distance from fragment center (accounting for clipping)
+                frag_center_x = frag_w // 2
+                frag_center_y = frag_h // 2
+                center_dist = np.sqrt((x_coords - frag_center_x)**2 + (y_coords - frag_center_y)**2)
+                max_dist = min(frag_w, frag_h) // 2
+                if max_dist > 0:
+                    weights = np.maximum(0, 1.0 - center_dist / max_dist)
+                else:
+                    weights = np.ones((frag_h, frag_w), dtype=np.float32)
+                
+                # Extract region
+                region = master_canvas[ty_clipped:ty_end, tx_clipped:tx_end]
+                region_coverage = coverage_map[ty_clipped:ty_end, tx_clipped:tx_end]
+                
+                # Create mask for non-zero pixels in fragment
+                mask = (visible_fragment.sum(axis=2) > 0).astype(np.float32)
+                new_weights = weights * mask
+                
+                # Blend: weighted average where both exist, direct placement where empty
+                total_weights = region_coverage + new_weights
+                total_weights = np.maximum(total_weights, 1e-6)  # Avoid division by zero
+                
+                # Weighted blend for each channel
+                for c in range(3):
+                    region_channel = region[:, :, c].astype(np.float32)
+                    frag_channel = visible_fragment[:, :, c].astype(np.float32)
+                    blended_channel = (region_channel * region_coverage + frag_channel * new_weights) / total_weights
+                    region[:, :, c] = blended_channel.astype(np.uint8)
+                
+                # Update coverage
+                coverage_map[ty_clipped:ty_end, tx_clipped:tx_end] = total_weights
+            
+            centers.append((int(wx - min_x), int(wy - min_y)))
+
+        # 5. Draw Breadcrumbs
+        if len(centers) > 1:
+            for i in range(len(centers) - 1):
+                cv2.line(master_canvas, centers[i], centers[i+1], self.COLOR_ORANGE, 2)
+            cv2.circle(master_canvas, centers[0], 8, self.COLOR_GREEN, -1)  # Start
+            cv2.circle(master_canvas, centers[-1], 8, self.COLOR_RED, -1)  # End
+        
+        # 6. Downsample
         final_map = cv2.resize(master_canvas, (0, 0), fx=self.MASTER_MAP_DOWNSAMPLE_FACTOR, fy=self.MASTER_MAP_DOWNSAMPLE_FACTOR, interpolation=cv2.INTER_AREA)
         return final_map
 
@@ -1183,46 +2760,46 @@ class VisualNavigator:
             return
         
         # Draw cropped images - show current even if previous (target) is not available
-        if cropped_curr is not None:
-            crop_h, crop_w = cropped_prev.shape[:2]  # Should be PHASE_CORR_CROP_SIZE x PHASE_CORR_CROP_SIZE
-            
-            # Calculate available space for each preview
-            left_half_w = w
-            right_half_w = canvas_w - (w + self.DEBUG_CANVAS_SPACING)
-            
-            # Calculate available vertical space
-            available_h = crop_preview_h - (self.DEBUG_CROP_PREVIEW_TOP_PADDING + self.DEBUG_CROP_PREVIEW_BOTTOM_PADDING)
-            
-            # Scale to fit within each half with padding, maintaining aspect ratio
-            padding = self.DEBUG_PADDING
-            max_display_w_left = left_half_w - padding * 2
-            max_display_w_right = right_half_w - padding * 2
-            max_display_w = min(max_display_w_left, max_display_w_right)
-            
-            # Calculate scale based on both width and height constraints
-            scale_w = max_display_w / crop_w
-            scale_h = available_h / crop_h
-            scale = min(scale_w, scale_h)  # Use the smaller scale to fit both dimensions
-            
-            display_crop_w = int(crop_w * scale)
-            display_crop_h = int(crop_h * scale)
-            
-            # Center previews in their respective halves (both horizontally and vertically)
-            preview_x1 = padding + (left_half_w - padding * 2 - display_crop_w) // 2
-            preview_x2 = w + self.DEBUG_CANVAS_SPACING + padding + (right_half_w - padding * 2 - display_crop_w) // 2
-            preview_y = crop_preview_y_start + self.DEBUG_CROP_PREVIEW_TOP_PADDING + (available_h - display_crop_h) // 2
-            
-            # Final bounds check to ensure everything fits
-            preview_x1 = max(0, min(preview_x1, w - display_crop_w))
-            preview_x2 = max(w + self.DEBUG_CANVAS_SPACING, min(preview_x2, canvas_w - display_crop_w))
-            preview_y = max(crop_preview_y_start + self.DEBUG_CROP_PREVIEW_TOP_PADDING, min(preview_y, crop_preview_y_end - display_crop_h - 10))
-            
-            # Calculate actual height for both previews
-            end_y = min(preview_y + display_crop_h, crop_preview_y_end)
-            actual_h = end_y - preview_y
-            
-            # Resize and display previous cropped image (left) - Target node
-            if cropped_prev is not None:
+        # Use cropped_curr for dimensions since we know it's not None
+        crop_h, crop_w = cropped_curr.shape[:2]  # Should be PHASE_CORR_CROP_SIZE x PHASE_CORR_CROP_SIZE
+        
+        # Calculate available space for each preview
+        left_half_w = w
+        right_half_w = canvas_w - (w + self.DEBUG_CANVAS_SPACING)
+        
+        # Calculate available vertical space
+        available_h = crop_preview_h - (self.DEBUG_CROP_PREVIEW_TOP_PADDING + self.DEBUG_CROP_PREVIEW_BOTTOM_PADDING)
+        
+        # Scale to fit within each half with padding, maintaining aspect ratio
+        padding = self.DEBUG_PADDING
+        max_display_w_left = left_half_w - padding * 2
+        max_display_w_right = right_half_w - padding * 2
+        max_display_w = min(max_display_w_left, max_display_w_right)
+        
+        # Calculate scale based on both width and height constraints
+        scale_w = max_display_w / crop_w
+        scale_h = available_h / crop_h
+        scale = min(scale_w, scale_h)  # Use the smaller scale to fit both dimensions
+        
+        display_crop_w = int(crop_w * scale)
+        display_crop_h = int(crop_h * scale)
+        
+        # Center previews in their respective halves (both horizontally and vertically)
+        preview_x1 = padding + (left_half_w - padding * 2 - display_crop_w) // 2
+        preview_x2 = w + self.DEBUG_CANVAS_SPACING + padding + (right_half_w - padding * 2 - display_crop_w) // 2
+        preview_y = crop_preview_y_start + self.DEBUG_CROP_PREVIEW_TOP_PADDING + (available_h - display_crop_h) // 2
+        
+        # Final bounds check to ensure everything fits
+        preview_x1 = max(0, min(preview_x1, w - display_crop_w))
+        preview_x2 = max(w + self.DEBUG_CANVAS_SPACING, min(preview_x2, canvas_w - display_crop_w))
+        preview_y = max(crop_preview_y_start + self.DEBUG_CROP_PREVIEW_TOP_PADDING, min(preview_y, crop_preview_y_end - display_crop_h - 10))
+        
+        # Calculate actual height for both previews
+        end_y = min(preview_y + display_crop_h, crop_preview_y_end)
+        actual_h = end_y - preview_y
+        
+        # Resize and display previous cropped image (left) - Target node
+        if cropped_prev is not None:
                 prev_display = cv2.resize(cropped_prev, (display_crop_w, display_crop_h), interpolation=cv2.INTER_LINEAR)
                 # Copy with bounds checking
                 end_x1 = min(preview_x1 + display_crop_w, w)
@@ -1240,29 +2817,29 @@ class VisualNavigator:
                 # Draw border around previous preview
                 cv2.rectangle(canvas, (preview_x1, preview_y), 
                              (preview_x1+display_crop_w, preview_y+display_crop_h), self.COLOR_GREEN, 2)
-            else:
-                # Show placeholder text if target not available
-                label_text = f"Target (N/A)"
-                cv2.putText(canvas, label_text, (preview_x1, preview_y + 20), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.COLOR_GRAY_LIGHT, 1)
-            
-            # Resize and display current cropped image (right) - Current real-time position
-            curr_display = cv2.resize(cropped_curr, (display_crop_w, display_crop_h), interpolation=cv2.INTER_LINEAR)
-            end_x2 = min(preview_x2 + display_crop_w, canvas_w)
-            actual_w2 = end_x2 - preview_x2
-            if actual_h > 0 and actual_w2 > 0 and preview_y >= 0 and preview_x2 >= 0:
-                src_h = min(actual_h, curr_display.shape[0])
-                src_w = min(actual_w2, curr_display.shape[1])
-                canvas[preview_y:preview_y+src_h, preview_x2:preview_x2+src_w] = curr_display[:src_h, :src_w]
-            
-            # Add label for current
-            label_text = f"Current ({self.PHASE_CORR_CROP_SIZE}x{self.PHASE_CORR_CROP_SIZE})"
-            cv2.putText(canvas, label_text, (preview_x2, preview_y - 10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.COLOR_WHITE, 1)
-            
-            # Draw border around current preview
-            cv2.rectangle(canvas, (preview_x2, preview_y), 
-                         (preview_x2+display_crop_w, preview_y+display_crop_h), self.COLOR_GREEN, 2)
+        else:
+            # Show placeholder text if target not available
+            label_text = f"Target (N/A)"
+            cv2.putText(canvas, label_text, (preview_x1, preview_y + 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.COLOR_GRAY_LIGHT, 1)
+        
+        # Resize and display current cropped image (right) - Current real-time position
+        curr_display = cv2.resize(cropped_curr, (display_crop_w, display_crop_h), interpolation=cv2.INTER_LINEAR)
+        end_x2 = min(preview_x2 + display_crop_w, canvas_w)
+        actual_w2 = end_x2 - preview_x2
+        if actual_h > 0 and actual_w2 > 0 and preview_y >= 0 and preview_x2 >= 0:
+            src_h = min(actual_h, curr_display.shape[0])
+            src_w = min(actual_w2, curr_display.shape[1])
+            canvas[preview_y:preview_y+src_h, preview_x2:preview_x2+src_w] = curr_display[:src_h, :src_w]
+        
+        # Add label for current
+        label_text = f"Current ({self.PHASE_CORR_CROP_SIZE}x{self.PHASE_CORR_CROP_SIZE})"
+        cv2.putText(canvas, label_text, (preview_x2, preview_y - 10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.COLOR_WHITE, 1)
+        
+        # Draw border around current preview
+        cv2.rectangle(canvas, (preview_x2, preview_y), 
+                     (preview_x2+display_crop_w, preview_y+display_crop_h), self.COLOR_GREEN, 2)
 
     def _draw_controller_visualization(self, canvas: np.ndarray, controller_state: Dict, 
                                         ctrl_y_start: int, canvas_w: int, canvas_h: int):

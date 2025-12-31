@@ -202,6 +202,48 @@ def update_route_structure(route_id, steps_data):
     finally:
         conn.close()
 
+def update_hybrid_route_structure(route_id, nodes_data):
+    """
+    Replaces the entire node structure for a HYBRID route.
+    
+    Args:
+        route_id: Route ID to update.
+        nodes_data: List of node dictionaries with structure:
+            {'timestamp': float, 'minimap_path': str, 'main_view_path': str, 
+             'input_intent': list, 'relative_offset': dict}
+            
+    Returns:
+        True if updated successfully, False otherwise.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        # Check type
+        c.execute("SELECT type FROM routes WHERE id = ?", (route_id,))
+        res = c.fetchone()
+        if not res or res[0] != "HYBRID":
+            print(f"Cannot update hybrid structure for route {route_id} (Type: {res[0] if res else 'None'})")
+            return False
+        
+        # 1. Delete all existing nodes for this route
+        c.execute("DELETE FROM hybrid_nodes WHERE route_id = ?", (route_id,))
+        
+        # 2. Re-insert nodes with updated order
+        for node_idx, node in enumerate(nodes_data):
+            intent_json = json.dumps(node.get('input_intent', []))
+            offset_json = json.dumps(node.get('relative_offset')) if node.get('relative_offset') else None
+            c.execute("INSERT INTO hybrid_nodes (route_id, node_order, timestamp, minimap_path, main_view_path, input_intent, relative_offset) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                      (route_id, node_idx, node['timestamp'], node['minimap_path'], 
+                       node['main_view_path'], intent_json, offset_json))
+        
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error updating hybrid route {route_id}: {e}")
+        return False
+    finally:
+        conn.close()
+
 def load_route(route_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
