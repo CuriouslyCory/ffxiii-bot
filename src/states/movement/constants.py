@@ -11,7 +11,7 @@ PHASE_CORR_CONFIDENCE_THRESHOLD = 0.05
 
 # Navigation Control - EMA Smoothing
 # Separate configuration for dx/dy vs angle
-EMA_ALPHA_DX_DY = 0.25  # EMA alpha for dx and dy smoothing
+EMA_ALPHA_DX_DY = 0.75  # EMA alpha for dx and dy smoothing
 EMA_WINDOW_SIZE_DX_DY = 30  # Number of samples in rolling window for dx/dy
 EMA_ALPHA_ANGLE = 0.25  # EMA alpha for angle smoothing
 EMA_WINDOW_SIZE_ANGLE = 30  # Number of samples in rolling window for angle
@@ -29,8 +29,8 @@ APPROACH_SLOWDOWN_DISTANCE = 40
 APPROACH_SLOWDOWN_MIN = 0.25
 
 # Seek/Recovery
-COAST_DURATION = 1.5
-COAST_DURATION_EXTENDED = 2.0  # When turning
+COAST_DURATION = 1.0
+COAST_DURATION_EXTENDED = 1.5  # When turning
 COAST_TURNING_THRESHOLD = 0.3
 COAST_FORWARD_THRESHOLD = 0.2
 RETRY_DURATION = 1.0
@@ -43,9 +43,9 @@ RETRY_SCALE_MIN = 0.2
 LOOKAHEAD_DEPTH = 3
 
 # Arrival detection (shared with navigator)
-ARRIVAL_DISTANCE_THRESHOLD = 20
-ARRIVAL_ANGLE_THRESHOLD = 90
-ARRIVAL_BUFFER_SIZE = 5
+ARRIVAL_DISTANCE_THRESHOLD = 15
+ARRIVAL_ANGLE_THRESHOLD = 45
+ARRIVAL_BUFFER_SIZE = 8
 
 # Landmark Playback
 LANDMARK_SEEK_TIMEOUT = 300.0  # 5 minutes

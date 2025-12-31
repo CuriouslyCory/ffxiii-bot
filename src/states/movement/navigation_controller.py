@@ -200,7 +200,7 @@ class NavigationController:
                 move_y *= slowdown
             
             # Strafe correction
-            move_x = sdx * -STRAFE_KP
+            move_x = sdx * STRAFE_KP
             move_x = max(-STRAFE_MAX, min(STRAFE_MAX, move_x))
         else:
             # Angle too large, stop moving and just rotate

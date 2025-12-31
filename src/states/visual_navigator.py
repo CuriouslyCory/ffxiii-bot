@@ -242,6 +242,10 @@ class VisualNavigator:
         
         # Angle unwrapping - track last angle to prevent flip-flopping
         self.last_unwrapped_angle = None  # Last unwrapped angle value
+        # Track angle offset for calibration (persistent offset between gold arrow and homography)
+        self.angle_offset_estimate = 0.0  # Estimated systematic offset
+        self.angle_offset_samples = []  # Samples for offset estimation
+        self.angle_offset_max_samples = 30  # Number of samples to use for offset estimation
         
         # Debugging
         self.debug_window_name = "Visual Odometry"
@@ -781,11 +785,9 @@ class VisualNavigator:
         """
         Unwrap angle to prevent flip-flopping between positive and negative values.
         
-        Maintains continuity by detecting wrap-arounds and adjusting angles accordingly.
-        Keeps angles in [-180, 180] range to prevent unbounded accumulation.
-        
-        Optionally uses gold arrow angle and target arrow angle to compute expected angle
-        for validation and correction.
+        When gold arrow angle is available, it's used as the primary source since it's
+        more stable than homography decomposition. When far from alignment, the gold
+        arrow is trusted more heavily to prevent wild oscillations.
         
         Args:
             angle: Raw angle from homography decomposition (in degrees, range -180 to 180).
@@ -813,13 +815,104 @@ class VisualNavigator:
             except:
                 pass
         
-        # Always use last_unwrapped_angle as the base reference for continuity
+        # If we have gold arrow angle, use it as primary source (it's more stable)
+        if expected_angle is not None:
+            # Estimate systematic offset between gold arrow and homography
+            # This helps correct for calibration issues
+            angle_diff_raw = angle - expected_angle
+            # Normalize difference
+            while angle_diff_raw > 180:
+                angle_diff_raw -= 360
+            while angle_diff_raw < -180:
+                angle_diff_raw += 360
+            
+            # Track offset samples (only when both angles are reasonable)
+            if abs(angle) < 90 and abs(expected_angle) < 90:
+                self.angle_offset_samples.append(angle_diff_raw)
+                if len(self.angle_offset_samples) > self.angle_offset_max_samples:
+                    self.angle_offset_samples.pop(0)
+                
+                # Update offset estimate as median of recent samples (more robust than mean)
+                if len(self.angle_offset_samples) >= 10:
+                    sorted_samples = sorted(self.angle_offset_samples)
+                    median_idx = len(sorted_samples) // 2
+                    self.angle_offset_estimate = sorted_samples[median_idx]
+            
+            # Apply offset correction to expected angle
+            corrected_expected = expected_angle - self.angle_offset_estimate
+            # Normalize
+            while corrected_expected > 180:
+                corrected_expected -= 360
+            while corrected_expected < -180:
+                corrected_expected += 360
+            
+            # When gold arrow is available, trust it more, especially when far from alignment
+            if self.last_unwrapped_angle is None:
+                # First reading - use corrected gold arrow
+                self.last_unwrapped_angle = corrected_expected
+                return corrected_expected
+            
+            # Normalize last angle
+            last_normalized = self.last_unwrapped_angle
+            while last_normalized > 180:
+                last_normalized -= 360
+            while last_normalized < -180:
+                last_normalized += 360
+            
+            # Calculate how far we are from alignment (using corrected expected)
+            abs_expected = abs(corrected_expected)
+            
+            # When far from alignment (>30 degrees), trust gold arrow almost completely
+            # When close to alignment (<30 degrees), blend with homography angle for precision
+            if abs_expected > 30:
+                # Far from alignment: trust corrected gold arrow 85%, homography 15%
+                # Increased homography weight to help correct systematic offsets
+                angle_diff = corrected_expected - last_normalized
+                # Normalize difference
+                while angle_diff > 180:
+                    angle_diff -= 360
+                while angle_diff < -180:
+                    angle_diff += 360
+                
+                # Smooth large changes (limit rate of change)
+                max_change = 15.0  # Max degrees per frame
+                if abs(angle_diff) > max_change:
+                    angle_diff = np.sign(angle_diff) * max_change
+                
+                result = last_normalized + angle_diff
+                # Blend with homography angle (15% - increased from 10% to help with offset correction)
+                result = 0.85 * result + 0.15 * angle
+            else:
+                # Close to alignment: blend corrected gold arrow (60%) with homography (40%)
+                # Increased homography weight when close for better precision
+                result = 0.7 * corrected_expected + 0.3 * angle
+                # Smooth transition from last angle
+                angle_diff = result - last_normalized
+                while angle_diff > 180:
+                    angle_diff -= 360
+                while angle_diff < -180:
+                    angle_diff += 360
+                # Limit rate of change even when close
+                max_change = 10.0
+                if abs(angle_diff) > max_change:
+                    angle_diff = np.sign(angle_diff) * max_change
+                result = last_normalized + angle_diff
+            
+            # Normalize result
+            while result > 180:
+                result -= 360
+            while result < -180:
+                result += 360
+            
+            self.last_unwrapped_angle = result
+            return result
+        
+        # No gold arrow available - fall back to homography angle with unwrapping
         if self.last_unwrapped_angle is None:
-            # First reading - initialize with raw angle
             self.last_unwrapped_angle = angle
             return angle
         
-        # Normalize last_unwrapped_angle to [-180, 180] (should already be normalized, but be safe)
+        # Normalize last angle
         last_normalized = self.last_unwrapped_angle
         while last_normalized > 180:
             last_normalized -= 360
@@ -836,48 +929,27 @@ class VisualNavigator:
             angle_diff += 360
         
         # If the difference is large (>90 degrees), it's likely a wrap-around
-        # This happens when angle flips from one side of 180/-180 to the other
-        # Add/subtract 360 to get the closer equivalent angle
         if abs(angle_diff) > 90:
             if angle_diff > 0:
                 angle_diff -= 360
             else:
                 angle_diff += 360
         
-        # Calculate result: last_normalized + adjusted_diff
-        # This maintains continuity while keeping result in reasonable range
+        # Apply smoothing to limit rate of change (especially important when far from alignment)
+        max_change = 20.0  # Max degrees per frame when no gold arrow
+        if abs(angle_diff) > max_change:
+            angle_diff = np.sign(angle_diff) * max_change
+        
+        # Calculate result
         result = last_normalized + angle_diff
         
-        # Normalize result to [-180, 180] to prevent accumulation
+        # Normalize result
         while result > 180:
             result -= 360
         while result < -180:
             result += 360
         
-        # Use expected angle from gold arrow for validation/correction if available
-        if expected_angle is not None:
-            # Check difference between result and expected (both normalized)
-            diff_from_expected = result - expected_angle
-            # Normalize difference
-            while diff_from_expected > 180:
-                diff_from_expected -= 360
-            while diff_from_expected < -180:
-                diff_from_expected += 360
-            
-            # Only apply correction if difference is reasonable (45-135 degrees)
-            # This prevents correcting when expected_angle is in a completely different range
-            if 45 < abs(diff_from_expected) < 135:
-                # Blend: 70% expected, 30% result (trust gold arrow more)
-                result = 0.7 * expected_angle + 0.3 * result
-                # Re-normalize after blending
-                while result > 180:
-                    result -= 360
-                while result < -180:
-                    result += 360
-        
-        # Store normalized result (keeps it in [-180, 180] range)
         self.last_unwrapped_angle = result
-        
         return result
     
     def get_gold_arrow_angle(self, image: np.ndarray) -> Tuple[float, Tuple[int, int]]:
@@ -933,8 +1005,27 @@ class VisualNavigator:
         dot = (tip[0] - cX) * vX + (tip[1] - cY) * vY
         if dot < 0: vX, vY = -vX, -vY
             
-        angle_rad = np.arctan2(vY, vX)
-        return np.degrees(angle_rad) + 90, centroid
+        # Calculate angle from eigenvector to match homography convention
+        # The eigenvector (vX, vY) points in the direction of the arrow tip
+        # In image coordinates: X increases right, Y increases down
+        # 
+        # Convention: 0° = Up, positive = Clockwise (CW)
+        # When arrow points up: vX ≈ 0, vY < 0 (negative Y = up in image coords)
+        # When arrow points right: vX > 0, vY ≈ 0 (right is 90° CW from up, so should be -90°)
+        #
+        # To convert direction vector to rotation angle:
+        # We want the angle that rotates (0, -1) [up vector] to (vX, vY)
+        # This is: angle = arctan2(vX, -vY)
+        #   Up (vX=0, vY<0): arctan2(0, -(-1)) = arctan2(0, 1) = 0° ✓
+        #   Right (vX>0, vY=0): arctan2(1, 0) = 90° (but we want -90° for CW)
+        #
+        # So we need to negate: angle = -arctan2(vX, -vY)
+        #   Up: -arctan2(0, 1) = 0° ✓
+        #   Right: -arctan2(1, 0) = -90° ✓
+        angle_rad = np.arctan2(vX, -vY)
+        angle_deg = -np.degrees(angle_rad)  # Negate to get CW positive convention
+        
+        return angle_deg, centroid
 
     def mask_center(self, image: np.ndarray, radius: int = None) -> np.ndarray:
         """
@@ -1036,7 +1127,8 @@ class VisualNavigator:
         # If either dx or dy exceeds half the center image width, use average instead
         if abs(dx) > max_offset_center or abs(dy) > max_offset_center:
             # Store original invalid values for logging
-            original_dx, original_dy = dx, dy
+            original_dx = max(-255, min(255, dx))
+            original_dy = max(-255, min(255, dy))
             
             # Invalid transformation - use average of recent values instead
             if self.dx_pc_history and self.dy_pc_history:
@@ -1051,8 +1143,8 @@ class VisualNavigator:
                     self.consecutive_invalid_pc_count = 0
                 self.consecutive_invalid_pc_count += 1
                 decay = self.average_decay_factor ** self.consecutive_invalid_pc_count
-                dx = avg_dx * decay
-                dy = avg_dy * decay
+                dx = original_dx #avg_dx * decay
+                dy = original_dy #avg_dy * decay
                 
                 print(f"[DRIFT_PC] Invalid offset (dx={original_dx:.1f}, dy={original_dy:.1f}), using decayed average (dx={dx:.1f}, dy={dy:.1f}, decay={decay:.3f}, count={self.consecutive_invalid_pc_count})")
             else:

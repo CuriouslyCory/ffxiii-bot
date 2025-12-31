@@ -54,19 +54,57 @@ class FeatureMatcher:
     def decompose_homography(self, M):
         """
         Decomposes the homography matrix to extract translation (dx, dy) and rotation (angle).
-        Assumes the transformation is mostly 2D rotation and translation (affine-like).
+        
+        For a full perspective homography, we need to properly extract rotation accounting for
+        scaling and perspective effects. The rotation is extracted from the top-left 2x2 submatrix
+        after normalizing for scale.
         """
         if M is None:
             return 0.0, 0.0, 0.0
-            
-        # Extract translation
-        dx = M[0, 2]
-        dy = M[1, 2]
         
-        # Extract rotation angle (approximate from top-left 2x2)
-        # M = [[cos(a), -sin(a), dx], [sin(a), cos(a), dy], [0, 0, 1]]
-        # atan2(sin(a), cos(a)) -> atan2(M[1,0], M[0,0])
-        angle_rad = np.arctan2(M[1, 0], M[0, 0])
+        # Normalize the homography matrix (divide by bottom-right element if not 1)
+        # This handles perspective normalization
+        if abs(M[2, 2]) > 1e-6:
+            M_normalized = M / M[2, 2]
+        else:
+            M_normalized = M
+        
+        # Extract translation from normalized matrix
+        # For perspective homography, translation is affected by the normalization
+        # We can get translation by transforming the origin
+        origin = np.array([[0.0], [0.0], [1.0]])
+        origin_transformed = M_normalized @ origin
+        if abs(origin_transformed[2, 0]) > 1e-6:
+            dx = origin_transformed[0, 0] / origin_transformed[2, 0]
+            dy = origin_transformed[1, 0] / origin_transformed[2, 0]
+        else:
+            # Fallback to direct extraction if normalization fails
+            dx = M_normalized[0, 2]
+            dy = M_normalized[1, 2]
+        
+        # Extract rotation from top-left 2x2 submatrix
+        # For a homography with rotation, the top-left 2x2 should approximate:
+        # [[cos(a)*s, -sin(a)*s], [sin(a)*s, cos(a)*s]] where s is scale
+        # We need to extract the rotation angle accounting for scale
+        
+        # Get the 2x2 rotation+scale matrix
+        R_scale = M_normalized[:2, :2]
+        
+        # Extract scale (average of the two scale factors)
+        scale_x = np.sqrt(R_scale[0, 0]**2 + R_scale[1, 0]**2)
+        scale_y = np.sqrt(R_scale[0, 1]**2 + R_scale[1, 1]**2)
+        scale = (scale_x + scale_y) / 2.0
+        
+        # Normalize rotation matrix by scale to get pure rotation
+        if scale > 1e-6:
+            R = R_scale / scale
+        else:
+            R = R_scale
+        
+        # Extract rotation angle from normalized rotation matrix
+        # R = [[cos(a), -sin(a)], [sin(a), cos(a)]]
+        # angle = atan2(sin(a), cos(a)) = atan2(R[1,0], R[0,0])
+        angle_rad = np.arctan2(R[1, 0], R[0, 0])
         angle_deg = np.degrees(angle_rad)
         
         return dx, dy, angle_deg
