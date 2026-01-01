@@ -6,18 +6,33 @@ This document describes how the bot detects game states using computer vision an
 
 The bot uses template matching and Region of Interest (ROI) slicing via OpenCV (`cv2`) to identify game states.
 
-### 1. Vision Engine (`src/vision.py`)
+### 1. Vision Engine (`src/core/vision.py`)
 The `VisionEngine` is the core component responsible for:
 - **Screen Capture**: Uses `mss` for high-performance screen grabbing.
 - **Template Matching**: Uses `cv2.matchTemplate` with `TM_CCOEFF_NORMED` for fuzzy matching.
 - **ROI Optimization**: Restricts searches to specific screen areas to improve performance and reduce false positives.
 - **Visualization**: Provides helper methods (`draw_roi`, `draw_match`) to overlay debug information.
+- **Feature Matching**: Includes ORB-based feature detection and matching for visual odometry.
 
 ### 2. State Detection (`src/states/*.py`)
 Each state (e.g., `BattleState`, `MovementState`) defines its own `is_active` logic:
 - **Movement**: Looks for the `minimap_outline` in the upper-right quadrant.
 - **Battle**: Looks for `paradigm_shift` or `hp_container` in the bottom half of the screen.
 - **Results**: Looks for the `battle_results` header in the top-left quadrant.
+
+### 3. Image Filters (`src/filters/*.py`)
+The bot uses a composable filter system for image processing:
+- **Color Filters**: HSV-based filters for isolating specific color ranges (blue, gold, red/alert)
+- **Edge Filters**: Canny and edge detection filters for feature extraction
+- **Composite Filters**: Chain multiple filters together with additive (union) or progressive (intersection) composition
+- Filters are reusable and can be applied to any image processing pipeline
+
+### 4. Sensors (`src/sensors/*.py`)
+Sensors provide state-specific detection capabilities:
+- **Base Sensor**: Abstract interface with enable/disable for lazy evaluation
+- **Sensor Registry**: Manages which sensors are available to which states
+- **Example Sensors**: HealthSensor (HP percentage), MinimapSensor (minimap extraction), CompassSensor (orientation)
+- Sensors only process when enabled, allowing performance optimization
 
 ---
 
@@ -32,6 +47,8 @@ This utility provides a real-time HUD of the bot's vision system.
 ```bash
 python src/debug-vision.py
 ```
+
+**Note**: The VisionEngine has been moved to `src/core/vision.py` in the new architecture.
 
 #### Visual Indicators:
 - **Blue Rectangles**: Defined Regions of Interest (ROIs). These are the "search zones" for specific templates.
@@ -66,11 +83,36 @@ If the game's UI has changed significantly:
 
 ---
 
+## Architecture Overview
+
+The bot follows a clean architecture with clear separation of concerns:
+
+- **Core Engine** (`src/core/`): VisionEngine, Controller, StateManager
+- **States** (`src/states/`): Game state classes with `is_active()` and `execute()` methods
+- **Skills** (`src/skills/`): Bot interaction capabilities (movement, buttons, macros)
+- **Sensors** (`src/sensors/`): Game state detection tools (health, minimap, compass)
+- **Filters** (`src/filters/`): Reusable image processing filters
+- **Visualizers** (`src/visualizers/`): Debug dashboards and visualization panels
+- **UI Components** (`src/ui/`): Input handling, menus, and dialogs
+
+This architecture improves maintainability, reusability, and testability.
+
 ## Extending Detection
 
 To add a new state detection:
 1. **Capture Template**: Add a new `.png` to `templates/`.
 2. **Define ROI**: Determine the static area where this UI element appears.
-3. **Update State**: Implement `is_active` in a new `State` subclass using `self.vision.find_template(..., roi=...)`.
-4. **Update Debugger**: Add the new ROI and template to `src/debug-vision.py`'s `ROIs` and `TEMPLATE_SEARCH_CONFIG` for visual verification.
+3. **Create State**: Create a new `State` subclass in `src/states/` implementing `is_active()` using `self.vision.find_template(..., roi=...)`.
+4. **Register State**: Add the state to StateManager in `src/main.py`.
+5. **Update Debugger**: Add the new ROI and template to `src/debug-vision.py`'s `ROIs` and `TEMPLATE_SEARCH_CONFIG` for visual verification.
+
+To add a new sensor:
+1. **Create Sensor**: Subclass `Sensor` in `src/sensors/` implementing `read()` method.
+2. **Register Sensor**: Register the sensor with `SensorRegistry` in the appropriate state.
+3. **Enable/Disable**: Use sensor's `enable()`/`disable()` methods for lazy evaluation.
+
+To add a new filter:
+1. **Create Filter**: Subclass `Filter` in `src/filters/` implementing `apply()` method.
+2. **Compose Filters**: Use `CompositeFilter` to chain multiple filters together.
+3. **Reuse**: Filters are reusable across different image processing pipelines.
 

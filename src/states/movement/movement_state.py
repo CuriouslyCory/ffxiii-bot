@@ -80,6 +80,7 @@ class MovementState(State):
         self.landmarks = []
         self.current_landmark_idx = 0
         self.current_route_id: Optional[int] = None
+        self.selecting_recording_type = False
         
         # Check for auto-resume
         self.check_auto_resume()
@@ -190,6 +191,41 @@ class MovementState(State):
                 self.stop_all()
             elif action == 'RECORD_MODE':
                 self.start_recording_dialog()
+            elif action == 'SELECT_RECORDING_TYPE':
+                data = self.input_handler.get_action_data('SELECT_RECORDING_TYPE')
+                if data and 'key' in data:
+                    try:
+                        choice = data['key']
+                        if self.selecting_recording_type:
+                            if choice == '1':
+                                self.start_recording("LANDMARK")
+                                self.selecting_recording_type = False
+                                # Restore normal menu bindings
+                                if self.menu_manager:
+                                    menu = self.get_menu()
+                                    if menu:
+                                        self.menu_manager.detach_menu()
+                                        self.menu_manager.attach_menu(menu)
+                            elif choice == '2':
+                                self.start_recording("HYBRID")
+                                self.selecting_recording_type = False
+                                # Restore normal menu bindings
+                                if self.menu_manager:
+                                    menu = self.get_menu()
+                                    if menu:
+                                        self.menu_manager.detach_menu()
+                                        self.menu_manager.attach_menu(menu)
+                            elif choice == 'q':
+                                print("Cancelled.")
+                                self.selecting_recording_type = False
+                                # Restore normal menu bindings
+                                if self.menu_manager:
+                                    menu = self.get_menu()
+                                    if menu:
+                                        self.menu_manager.detach_menu()
+                                        self.menu_manager.attach_menu(menu)
+                    except (ValueError, KeyError):
+                        pass
             elif action == 'LIST_ROUTES':
                 self.list_available_routes()
             elif action == 'SELECT_ROUTE':
@@ -367,28 +403,20 @@ class MovementState(State):
     
     def start_recording_dialog(self):
         """Start recording with type selection dialog."""
-        # For now, use simple print/input approach
-        # Could be enhanced with a proper menu dialog later
-        self.input_handler.set_blocking(True)
-        try:
-            print("\nSelect Recording Type:")
-            print("  1. Landmark Routing")
-            print("  2. Hybrid Visual Odometry")
-            print("  q. Cancel")
-            
-            # Use simple input for now (text input dialog is better for route names)
-            choice = input("> ").strip().lower()
-            
-            if choice == '1':
-                self.start_recording("LANDMARK")
-            elif choice == '2':
-                self.start_recording("HYBRID")
-            elif choice == 'q':
-                print("Cancelled.")
-        except Exception as e:
-            print(f"Error: {e}")
-        finally:
-            self.input_handler.set_blocking(False)
+        self.selecting_recording_type = True
+        print("\nSelect Recording Type:")
+        print("  1. Landmark Routing")
+        print("  2. Hybrid Visual Odometry")
+        print("  q. Cancel")
+        print("Press number key (1, 2) or 'q' to select.")
+        
+        # Add temporary key bindings for recording type selection
+        recording_type_bindings = {
+            '1': 'SELECT_RECORDING_TYPE',
+            '2': 'SELECT_RECORDING_TYPE',
+            'q': 'SELECT_RECORDING_TYPE'
+        }
+        self.input_handler.add_key_bindings(recording_type_bindings)
     
     def start_recording(self, r_type: str):
         """Start recording a route."""
@@ -407,7 +435,7 @@ class MovementState(State):
         self.recording_preview_viz.cleanup()
         self.debug_visualizer.cleanup_windows()
         
-        self.input_handler.set_blocking(True)
+        # Use text input dialog for route name
         try:
             name = self.text_input.prompt("Enter name for this route", "")
             if not name:
@@ -417,8 +445,11 @@ class MovementState(State):
                 print(f"[SAVED] Route '{name}' saved to database.")
             else:
                 print("[ERROR] Failed to save route.")
-        finally:
-            self.input_handler.set_blocking(False)
+        except Exception as e:
+            print(f"[ERROR] Failed to get route name: {e}")
+            name = f"Route_{int(time.time())}"
+            if self.route_manager.save_route(name, data, self.route_type, master_map_path):
+                print(f"[SAVED] Route '{name}' saved to database (using default name).")
         
         self.mode = "IDLE"
     
@@ -432,6 +463,11 @@ class MovementState(State):
         for i, r in enumerate(routes):
             print(f" {i+1}. {r[1]} [{r[3]}] (Created: {r[2]})")
         print("Press number key (0-9) to select an option.")
+        
+        # Add temporary key bindings for number keys when in SELECTING mode
+        # These will work alongside the existing menu bindings
+        route_selection_bindings = {str(i): 'SELECT_ROUTE' for i in range(10)}
+        self.input_handler.add_key_bindings(route_selection_bindings)
     
     def select_route(self, index: int):
         """Select a route by index."""
@@ -447,19 +483,20 @@ class MovementState(State):
         # Check if route is in progress
         active = self.route_manager.get_active_route()
         if active and str(active['route_id']) == str(route_id):
-            self.input_handler.set_blocking(True)
+            # Use text input dialog for resume question
             try:
                 print(f"\n[RESUME] Route '{route_data['name']}' is in progress at step {active['current_idx']}.")
-                print("  Do you want to Resume from there? (y/n)")
-                ans = input("> ").strip().lower()
-                if ans == 'y':
+                ans = self.text_input.prompt("Resume from there? (y/n)", "y")
+                if ans and ans.lower() == 'y':
                     start_idx = int(active['current_idx'])
                     print(f"Resuming at step {start_idx}.")
                 else:
                     print("Starting from beginning.")
                     self.route_manager.clear_active_route()
-            finally:
-                self.input_handler.set_blocking(False)
+            except Exception as e:
+                print(f"[ERROR] Failed to get resume choice: {e}")
+                print("Starting from beginning.")
+                self.route_manager.clear_active_route()
         
         self.load_route_data(route_data)
         self.current_landmark_idx = start_idx
@@ -467,6 +504,16 @@ class MovementState(State):
         
         print(f"[SELECTED] Route '{route_data['name']}' loaded. Press 'u' to start.")
         self.mode = "IDLE"
+        
+        # Restore normal menu bindings by re-attaching the menu
+        # This will reset bindings to the menu definition only
+        if self.menu_manager:
+            menu = self.get_menu()
+            if menu:
+                # Detach current menu and reattach to clear route selection bindings
+                self.menu_manager.detach_menu()
+                self.menu_manager.attach_menu(menu)
+        
         self.route_playback_viz.show()
     
     def start_random_movement(self):
@@ -474,6 +521,15 @@ class MovementState(State):
         self.mode = "RANDOM_MOVEMENT"
         self.random_player.start()
         print("\n[RANDOM] Random movement mode started. Press ESC to stop.")
+        
+        # Restore normal menu bindings by re-attaching the menu
+        # This will reset bindings to the menu definition only
+        if self.menu_manager:
+            menu = self.get_menu()
+            if menu:
+                # Detach current menu and reattach to clear route selection bindings
+                self.menu_manager.detach_menu()
+                self.menu_manager.attach_menu(menu)
     
     def start_playback(self):
         """Start playback of loaded route."""

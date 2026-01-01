@@ -171,6 +171,15 @@ class RecordingPreviewVisualizer(Visualizer):
         """Initialize recording preview visualizer."""
         super().__init__("Landmark Preview")
     
+    def show(self):
+        """Show the visualizer window."""
+        super().show()
+        try:
+            cv2.namedWindow(self.window_name, cv2.WINDOW_AUTOSIZE)
+        except cv2.error:
+            # Window might already exist, which is fine
+            pass
+    
     def render(self, image: np.ndarray, data: Dict[str, Any]) -> np.ndarray:
         """
         Render the recording preview.

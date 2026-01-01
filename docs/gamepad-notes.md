@@ -4,6 +4,8 @@
 
 This document describes the gamepad configuration for the FFXIII bot. The bot uses `vgamepad` to emulate an Xbox 360 controller.
 
+**Note**: The Controller has been moved to `src/core/controller.py` in the new architecture. Interaction with the controller is typically done through Skills (`src/skills/`) rather than directly.
+
 ## Virtual Controller
 
 The bot creates a virtual **Xbox 360 Controller**.
@@ -49,3 +51,14 @@ If buttons are not triggering actions:
 
 1. Check the console output of the bot for any error messages regarding `vgamepad`.
 2. Ensure the game is focused.
+
+## Skills System
+
+In the new architecture, controller interactions are managed through Skills (`src/skills/`):
+
+- **MovementSkill**: Manages character movement with state tracking
+- **CameraSkill**: Manages camera movement
+- **ButtonPressSkill/ButtonTapSkill**: Handles button press/tap actions
+- **MacroSkill**: Executes sequences of controller actions
+
+Skills provide a cleaner interface and maintain their own state, making the codebase more maintainable.
