@@ -21,7 +21,6 @@ class Action(Enum):
     DELETE_CURRENT_IMAGE = "delete_current_image"
     DELETE_NEXT_IMAGE = "delete_next_image"
     DELETE_NEXT_NODE = "delete_next_node"
-    TOGGLE_HSV_DEBUG = "toggle_hsv_debug"
     RANDOM_MOVEMENT = "random_movement"
 
 
@@ -92,8 +91,6 @@ class InputHandler:
             self._add_action(Action.PLAYBACK)
         elif k_char == 'p':
             self._add_action(Action.LIST_ROUTES)
-        elif k_char == 'd':
-            self._add_action(Action.TOGGLE_HSV_DEBUG)
         elif k_char == '2':
             self._add_action(Action.DELETE_CURRENT_IMAGE)
         elif k_char == '3':

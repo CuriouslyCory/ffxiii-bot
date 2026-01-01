@@ -12,6 +12,8 @@ from src.core.manager import StateManager
 from src.states.movement import MovementState
 from src.states.battle import BattleState
 from src.states.results import ResultsState
+from src.states.hostile_detected import HostileDetectedState
+from src.states.movement.constants import WINDOW_OFFSET, RESOLUTION
 
 def main():
     """
@@ -19,11 +21,6 @@ def main():
     
     Initializes vision, controller, and state manager, then enters the main loop.
     """
-    # Configuration: Adjust these to match your environment
-    # WINDOW_OFFSET should be the (x, y) coordinate of the game's top-left corner.
-    WINDOW_OFFSET = (0, 0) 
-    RESOLUTION = (1920, 1080)
-    
     vision = VisionEngine(window_offset=WINDOW_OFFSET, resolution=RESOLUTION)
     controller = Controller()
     
@@ -61,13 +58,16 @@ def main():
     manager = StateManager(vision, controller)
     
     # Register game states
+    # Note: HostileDetectedState is checked before MovementState since it's more specific
+    # (both detect minimap, but hostile_detected uses red frame vs blue frame)
+    manager.add_state(HostileDetectedState(manager))
     manager.add_state(MovementState(manager))
     manager.add_state(BattleState(manager))
     manager.add_state(ResultsState(manager))
     
     print("\nBot initialized. Ready to run.")
     print("Instructions:")
-    print(" 1. Ensure FFXIII is running in 1920x1080 windowed mode.")
+    print(f" 1. Ensure FFXIII is running in {RESOLUTION[0]}x{RESOLUTION[1]} windowed mode.")
     print(f" 2. Ensure the window is at screen position {WINDOW_OFFSET}.")
     print(" 3. Press Ctrl+C in this terminal to stop the bot.\n")
     

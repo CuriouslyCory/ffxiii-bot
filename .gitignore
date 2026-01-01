@@ -8,5 +8,5 @@ wheels/
 
 # Virtual environments
 .venv
-templates
+templates/landmarks/
 data/*.db

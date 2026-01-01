@@ -20,6 +20,7 @@ from src.ui.menu import MenuDefinition, MenuItem, MenuManager
 from src.ui.text_input import TextInputDialog
 from src.skills.movement import MovementSkill, CameraSkill
 from src.visualizers.route import RoutePlaybackVisualizer, RecordingPreviewVisualizer
+from src.sensors.minimap_state import MinimapStateSensor
 from .route_manager import RouteManager
 from .route_recorder import RouteRecorder
 from .route_player import RoutePlayer, RandomMovementPlayer
@@ -46,6 +47,9 @@ class MovementState(State):
         self.route_manager = RouteManager(self.vision)
         self.nav_controller = NavigationController()
         self.seek_strategy = SeekStrategy()
+        
+        # Sensors
+        self.minimap_state_sensor = MinimapStateSensor(manager.roi_cache)
         
         # New UI system
         self.input_handler = InputHandler()
@@ -117,10 +121,21 @@ class MovementState(State):
         print(f"Loaded {self.route_type} route '{route_data['name']}' with {len(self.landmarks)} steps.")
     
     def is_active(self, image) -> bool:
-        """Check if movement state is active."""
-        roi = (960, 0, 960, 540)
-        match = self.vision.find_template("minimap_outline", image, threshold=0.25, roi=roi)
-        return match is not None
+        """
+        Check if movement state is active.
+        
+        Uses MinimapStateSensor to detect blue minimap frame (movement state).
+        """
+        # Enable sensor temporarily for detection
+        self.minimap_state_sensor.enable()
+        
+        # Read minimap state
+        state = self.minimap_state_sensor.read(image)
+        
+        # Disable sensor after reading (will be re-enabled in execute if needed)
+        self.minimap_state_sensor.disable()
+        
+        return state == "movement"
     
     def get_menu(self) -> MenuDefinition:
         """
@@ -135,7 +150,6 @@ class MovementState(State):
                 MenuItem('r', 'Start New Recording (will prompt for type)', 'RECORD_MODE'),
                 MenuItem('p', 'Playback Menu (0=Random Movement, 1-9=Select Route)', 'LIST_ROUTES'),
                 MenuItem('u', 'Resume Current Loaded Route', 'PLAYBACK'),
-                MenuItem('d', 'Toggle HSV Filter Debug Mode (during playback)', 'TOGGLE_HSV_DEBUG'),
                 MenuItem('2', 'Delete Current Image (during playback)', 'DELETE_CURRENT_IMAGE'),
                 MenuItem('3', 'Delete Next Image (during playback)', 'DELETE_NEXT_IMAGE'),
                 MenuItem('4', 'Delete Next Node (during playback)', 'DELETE_NEXT_NODE'),
@@ -147,6 +161,9 @@ class MovementState(State):
         super().on_enter()  # This calls attach_input_listeners()
         print(f"\n--- Movement State ({self.mode}) ---")
         
+        # Enable minimap state sensor
+        self.minimap_state_sensor.enable()
+        
         if self.mode == "RECORDING":
             print("  [RESUMED] Recording in progress.")
         elif self.mode == "PLAYBACK":
@@ -155,6 +172,9 @@ class MovementState(State):
     def on_exit(self):
         """Called when exiting the state."""
         super().on_exit()  # This calls detach_input_listeners()
+        
+        # Disable minimap state sensor
+        self.minimap_state_sensor.disable()
         
         # Stop movement and camera using skills
         self.movement_skill.stop()
@@ -256,11 +276,6 @@ class MovementState(State):
                         self.delete_next_node(next_idx)
                     else:
                         print("[DELETE] No next node to delete (at end of route).")
-            elif action == 'TOGGLE_HSV_DEBUG':
-                if self.navigator.hsv_debug_enabled:
-                    self.navigator.disable_hsv_debug()
-                else:
-                    self.navigator.enable_hsv_debug()
             elif action == 'PLAYBACK':
                 self.start_playback()
             elif action == 'SAVE_EXIT':
@@ -334,15 +349,13 @@ class MovementState(State):
             self.movement_skill.move(result['move_x'], result['move_y'])
             
             # Show debug (still using old visualizer for odometry)
+            # HSV debug is automatically shown when odometry debug is shown
             self.debug_visualizer.show_odometry_debug(
                 image, result.get('target_mm'),
                 self.controller.state,
                 tracking_active=(result.get('status') == 'TRACKING'),
                 status_msg=result.get('status', '')
             )
-            
-            if self.navigator.hsv_debug_enabled:
-                self.debug_visualizer.show_hsv_debug(image)
         else:
             # LANDMARK mode
             result = self.route_player.process_frame(

@@ -2,6 +2,12 @@
 Constants and configuration values for movement state.
 """
 
+# Screen/window configuration
+# WINDOW_OFFSET: (x, y) coordinate of the game's top-left corner on the screen
+WINDOW_OFFSET = (0, 60)
+# RESOLUTION: (width, height) of the game window
+RESOLUTION = (1920, 1080)
+
 # Directory paths
 LANDMARK_DIR = "templates/landmarks"
 
@@ -93,8 +99,8 @@ MESH_WARPING_GRID_SIZE = 10  # Grid cells per dimension for mesh warping
 MESH_WARPING_BLEND_RADIUS = 5  # Blending radius in pixels
 
 # Random Movement Mode
-RANDOM_TURN_INTERVAL_MIN = 1.0  # Minimum seconds between turns
-RANDOM_TURN_INTERVAL_MAX = 13.0  # Maximum seconds between turns
+RANDOM_TURN_INTERVAL_MIN = 0.75  # Minimum seconds between turns
+RANDOM_TURN_INTERVAL_MAX = 1.2  # Maximum seconds between turns
 RANDOM_TURN_DURATION_MIN = 0.5  # Minimum seconds for a turn
 RANDOM_TURN_DURATION_MAX = 1.0  # Maximum seconds for a turn
 RANDOM_CAMERA_PAN_SPEED = 0.75  # Camera pan speed when turning right

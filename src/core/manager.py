@@ -3,6 +3,7 @@ from typing import List, Optional, Type
 import numpy as np
 from src.core.vision import VisionEngine
 from src.core.controller import Controller
+from src.core.roi_cache import ROICache
 from src.states.base import State
 
 class StateManager:
@@ -23,6 +24,13 @@ class StateManager:
         self.controller = controller
         self.states: List[State] = []
         self.current_state: Optional[State] = None
+        
+        # Initialize ROI cache
+        self.roi_cache = ROICache(vision)
+        
+        # Register common ROIs
+        # Minimap ROI: (x, y, width, height) - no stretching for base extraction
+        self.roi_cache.register_roi("minimap", (1375, 57,  320, 425))
 
     def add_state(self, state: State):
         """
@@ -38,6 +46,9 @@ class StateManager:
         
         Checks if the current state is still active, otherwise searches for a new one.
         """
+        # Clear ROI cache at start of each frame
+        self.roi_cache.clear_cache()
+        
         image = self.vision.capture_screen()
         
         # Check if current state is still active

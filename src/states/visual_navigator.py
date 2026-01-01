@@ -23,7 +23,8 @@ from .movement.constants import (
     BUNDLE_ADJUSTMENT_XTOL,
     BUNDLE_ADJUSTMENT_GTOL,
     MESH_WARPING_GRID_SIZE,
-    MESH_WARPING_BLEND_RADIUS
+    MESH_WARPING_BLEND_RADIUS,
+    RESOLUTION
 )
 
 class VisualNavigator:
@@ -3127,7 +3128,7 @@ class VisualNavigator:
         cv2.imshow(self.debug_window_name, debug_canvas)
         if not hasattr(self, '_debug_win_pos_set'):
             win_x, win_y = self.vision.window_offset if hasattr(self.vision, 'window_offset') else (0, 0)
-            win_w, win_h = self.vision.resolution if hasattr(self.vision, 'resolution') else (1920, 1080)
+            win_w, win_h = self.vision.resolution if hasattr(self.vision, 'resolution') else RESOLUTION
             cv2.namedWindow(self.debug_window_name)
             cv2.moveWindow(self.debug_window_name, win_x + win_w + 10, win_y + 100)
             self._debug_win_pos_set = True

@@ -19,11 +19,12 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from src.core.vision import VisionEngine
+from src.states.movement.constants import WINDOW_OFFSET as DEFAULT_WINDOW_OFFSET, RESOLUTION
 
 def main():
-    # Configuration: Match these with your game settings/main.py
-    WINDOW_OFFSET = (0, 60)
-    RESOLUTION = (1920, 1080)
+    # Configuration: Override WINDOW_OFFSET if needed for debug
+    # Default values are imported from constants.py
+    WINDOW_OFFSET = (0, 60)  # Override for debug window positioning
     
     vision = VisionEngine(window_offset=WINDOW_OFFSET, resolution=RESOLUTION)
     

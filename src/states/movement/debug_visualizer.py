@@ -167,6 +167,7 @@ class DebugVisualizer:
                            status_msg: str = ""):
         """
         Show visual odometry debug window (delegates to navigator).
+        Automatically enables and shows HSV filter debug window when Visual Odometry panel is open.
         
         Args:
             image: Current screen image.
@@ -175,9 +176,16 @@ class DebugVisualizer:
             tracking_active: Whether tracking is active.
             status_msg: Status message to display.
         """
+        # Automatically enable HSV debug when Visual Odometry panel is shown
+        if not self.navigator.hsv_debug_enabled:
+            self.navigator.enable_hsv_debug()
+        
         self.navigator.show_debug_view(image, target_mm, controller_state,
                                       tracking_active=tracking_active,
                                       status_msg=status_msg)
+        
+        # Show HSV debug window
+        self.show_hsv_debug(image)
     
     def show_hsv_debug(self, image: np.ndarray):
         """
