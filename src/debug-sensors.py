@@ -783,7 +783,7 @@ def main():
     # Configuration: Uses constants from src/states/movement/constants.py
     vision = VisionEngine(window_offset=WINDOW_OFFSET, resolution=RESOLUTION)
     roi_cache = ROICache(vision)
-    roi_cache.register_roi("minimap", (1375, 57, 320, 425))
+    roi_cache.register_roi("minimap", (1375, 57, 425, 320))
     roi_cache.register_roi("minimap_center_arrow", (1575, 203, 30, 30))
     
     # Load templates that sensors might need

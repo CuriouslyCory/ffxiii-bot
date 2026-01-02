@@ -32,8 +32,8 @@ class EnemyPositionSensor(Sensor):
         # For more saturated red: higher saturation threshold
         # Using H=0-12 (red range), S=150-255 (higher saturation), V=150-255 (bright)
         self.enemy_red_filter = HSVFilter(
-            lower=(0, 150, 150),
-            upper=(12, 255, 255),
+            lower=(0, 68, 246),
+            upper=(3, 255, 255),
             name="Enemy Red Filter",
             description="Filters for saturated red enemy dots on minimap"
         )

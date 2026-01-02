@@ -30,7 +30,7 @@ class StateManager:
         
         # Register common ROIs
         # Minimap ROI: (x, y, width, height) - no stretching for base extraction
-        self.roi_cache.register_roi("minimap", (1375, 57,  320, 425))
+        self.roi_cache.register_roi("minimap", (1375, 57,  425, 320))
         self.roi_cache.register_roi("minimap_center_arrow", (1575, 203, 30, 30))
 
     def add_state(self, state: State):

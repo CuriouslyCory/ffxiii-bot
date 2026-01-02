@@ -2,6 +2,7 @@ from src.states.base import State
 from src.skills.button import ButtonTapSkill
 from src.sensors.health import HealthSensor
 from src.ui.menu import MenuDefinition, MenuItem
+from src.ui.input_handler import InputHandler
 import time
 import numpy as np
 import cv2
@@ -32,6 +33,13 @@ class BattleState(State):
             ]
         )
         
+        # Pause state
+        self.paused = False
+        
+        # Input handler for pause hotkey
+        self.input_handler = InputHandler()
+        self.input_handler.set_key_bindings({'p': 'TOGGLE_PAUSE'})
+        
         # Sensors can be managed directly or via registry if sub-states are added
     
     def is_active(self, image) -> bool:
@@ -55,6 +63,17 @@ class BattleState(State):
         """
         Executes battle instructions using skills.
         """
+        # Check for pause toggle action
+        actions = self.input_handler.get_pending_actions()
+        if 'TOGGLE_PAUSE' in actions:
+            self.paused = not self.paused
+            status = "PAUSED" if self.paused else "RESUMED"
+            print(f"Battle state {status}")
+        
+        # If paused, skip button pressing
+        if self.paused:
+            return
+        
         # Check health using sensor (only if enabled)
         if self.health_sensor.is_enabled:
             is_low = self.health_sensor.is_low_health(image, threshold_percent=30.0)
@@ -78,6 +97,7 @@ class BattleState(State):
         return MenuDefinition(
             title="Battle State",
             items=[
+                MenuItem('p', 'Toggle Pause', 'TOGGLE_PAUSE'),
                 # Could add menu items here if needed
                 # MenuItem('h', 'Toggle Health Sensor', 'TOGGLE_HEALTH'),
             ]

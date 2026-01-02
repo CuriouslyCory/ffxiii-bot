@@ -58,12 +58,12 @@ def main():
     manager = StateManager(vision, controller)
     
     # Register game states
-    # Note: HostileDetectedState is checked before MovementState since it's more specific
-    # (both detect minimap, but hostile_detected uses red frame vs blue frame)
+    # Note: MovementState is checked last as a fallback, only after other states fail to match
+    # (HostileDetectedState uses red frame vs MovementState's blue frame minimap detection)
     manager.add_state(HostileDetectedState(manager))
-    manager.add_state(MovementState(manager))
     manager.add_state(BattleState(manager))
     manager.add_state(ResultsState(manager))
+    manager.add_state(MovementState(manager))
     
     print("\nBot initialized. Ready to run.")
     print("Instructions:")

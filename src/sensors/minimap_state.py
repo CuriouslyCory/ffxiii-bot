@@ -104,6 +104,15 @@ class MinimapStateSensor(Sensor):
         )
         self.register_filter("minimap_hostile_detected", minimap_hostile_detected)
         
+        # Create combined blue+alert filter for pre-check (additive mode)
+        minimap_color_filter = CompositeFilter(
+            [blue_filter, alert_filter],
+            mode="additive",
+            name="Minimap Color Filter (Blue+Alert)",
+            description="Combined blue and alert color filter for minimap pre-check"
+        )
+        self.register_filter("minimap_color_filter", minimap_color_filter)
+        
         # Store mask filters for potential parameter adjustment
         self.register_filter("outer_mask", outer_mask)
         self.register_filter("inner_mask", inner_mask)
@@ -152,9 +161,10 @@ class MinimapStateSensor(Sensor):
         """
         Detect if the ROI actually contains a minimap by template matching.
         
-        Uses the same mask and grayscale preprocessing for both the ROI and template
-        to ensure consistent matching. This prevents false positives from blue sky
-        or red lava that might match color filters.
+        Uses the same mask and color filter preprocessing for both the ROI and template
+        to ensure consistent matching. Applies a combined blue+alert color filter to
+        full-color images before template matching. This prevents false positives from
+        blue sky or red lava that might match color filters.
         
         Args:
             minimap_image: Extracted minimap ROI image
@@ -162,17 +172,20 @@ class MinimapStateSensor(Sensor):
         Returns:
             True if minimap template is detected, False otherwise
         """
-        # Get the minimap_frame filter (same masks used in color detection)
+        # Get the minimap_frame filter and color filter (same masks used in color detection)
         minimap_frame_filter = self._registered_filters.get("minimap_frame")
-        if not minimap_frame_filter:
+        minimap_color_filter = self._registered_filters.get("minimap_color_filter")
+        if not minimap_frame_filter or not minimap_color_filter:
             # If filters aren't set up, can't verify minimap - return True to allow color check
             return True
         
         # Apply the same mask to the ROI image
         masked_roi = minimap_frame_filter.apply(minimap_image)
+        self.register_debug_output("minimap_precheck_masked_roi", masked_roi)
         
-        # Convert to grayscale
-        roi_gray = cv2.cvtColor(masked_roi, cv2.COLOR_BGR2GRAY)
+        # Apply combined blue+alert color filter to full-color masked ROI
+        roi_color_filtered = minimap_color_filter.apply(masked_roi)
+        self.register_debug_output("minimap_precheck_roi_color_filtered", roi_color_filtered)
         
         # Get template if available
         if not hasattr(self.roi_cache, 'vision') or not self.roi_cache.vision:
@@ -195,7 +208,7 @@ class MinimapStateSensor(Sensor):
             print("Template is larger than ROI, can't match it")
             return False
         
-        # Apply the same mask and grayscale to template
+        # Apply the same mask and color filter to template
         # First resize template to ROI size if different
         if template_h != h or template_w != w:
             template_resized = cv2.resize(template, (w, h), interpolation=cv2.INTER_LINEAR)
@@ -204,18 +217,52 @@ class MinimapStateSensor(Sensor):
         
         # Apply the same minimap_frame mask to template
         masked_template = minimap_frame_filter.apply(template_resized)
+        self.register_debug_output("minimap_precheck_masked_template", masked_template)
         
-        # Convert to grayscale
-        template_gray = cv2.cvtColor(masked_template, cv2.COLOR_BGR2GRAY)
+        # Apply combined blue+alert color filter to full-color masked template
+        template_color_filtered = minimap_color_filter.apply(masked_template)
+        self.register_debug_output("minimap_precheck_template_color_filtered", template_color_filtered)
         
-        # Check for match using template matching
-        # Since both images are already masked and grayscale, we can use normalized correlation
-        result = cv2.matchTemplate(roi_gray, template_gray, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, _ = cv2.minMaxLoc(result)
+        # Check for match using template matching on full-color filtered images
+        # cv2.matchTemplate works on multi-channel images (matches each channel and combines)
+        result = cv2.matchTemplate(roi_color_filtered, template_color_filtered, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
         
-        # Use threshold of 0.7 as it should be a high confidence match
+        # Normalize match result to 0-255 range for visualization
+        match_result_viz = cv2.normalize(result, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        match_result_viz_bgr = cv2.cvtColor(match_result_viz, cv2.COLOR_GRAY2BGR)
+        # Draw match location
+        cv2.circle(match_result_viz_bgr, max_loc, 5, (0, 255, 0), 2)
+        self.register_debug_output("minimap_precheck_match_result", match_result_viz_bgr)
+        
+        # Create annotated visualization with sensor data
         threshold = 0.3
-        return max_val >= threshold
+        match_passed = max_val >= threshold
+        status_color = (0, 255, 0) if match_passed else (0, 0, 255)
+        status_text = "PASS" if match_passed else "FAIL"
+        
+        # Create visualization image showing match data
+        viz_height = max(roi_color_filtered.shape[0], 150)
+        viz_width = roi_color_filtered.shape[1]
+        sensor_data_viz = np.zeros((viz_height, viz_width, 3), dtype=np.uint8)
+        
+        # Place color-filtered ROI on top
+        sensor_data_viz[:roi_color_filtered.shape[0], :roi_color_filtered.shape[1]] = roi_color_filtered
+        
+        # Add text annotations with sensor data
+        y_offset = roi_color_filtered.shape[0] + 20
+        cv2.putText(sensor_data_viz, f"Match Value: {max_val:.3f}", (10, y_offset),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(sensor_data_viz, f"Threshold: {threshold:.3f}", (10, y_offset + 25),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(sensor_data_viz, f"Status: {status_text}", (10, y_offset + 50),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+        cv2.putText(sensor_data_viz, f"Match Location: {max_loc}", (10, y_offset + 75),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        self.register_debug_output("minimap_precheck_sensor_data", sensor_data_viz)
+        
+        return match_passed
     
     def _detect_frame_color(self, minimap_image: np.ndarray) -> Optional[str]:
         """
@@ -273,12 +320,42 @@ class MinimapStateSensor(Sensor):
         # Threshold for detection (at least 5% of border pixels must match)
         threshold = 0.05
         
+        # Determine detected state
+        detected_state = None
         if blue_ratio > threshold and blue_ratio > red_ratio:
-            return "movement"
+            detected_state = "movement"
         elif red_ratio > threshold and red_ratio > blue_ratio:
-            return "hostile_detected"
+            detected_state = "hostile_detected"
         
-        return None
+        # Create sensor data visualization
+        viz_height = 200
+        viz_width = max(masked_frame.shape[1], 400)
+        sensor_data_viz = np.zeros((viz_height, viz_width, 3), dtype=np.uint8)
+        
+        # Add text annotations with sensor data
+        y_offset = 20
+        cv2.putText(sensor_data_viz, f"Blue Count: {blue_count}", (10, y_offset),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+        cv2.putText(sensor_data_viz, f"Red Count: {red_count}", (10, y_offset + 20),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+        cv2.putText(sensor_data_viz, f"Total Border Pixels: {total_border_pixels}", (10, y_offset + 40),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(sensor_data_viz, f"Blue Ratio: {blue_ratio:.3f}", (10, y_offset + 60),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+        cv2.putText(sensor_data_viz, f"Red Ratio: {red_ratio:.3f}", (10, y_offset + 80),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+        cv2.putText(sensor_data_viz, f"Threshold: {threshold:.3f}", (10, y_offset + 100),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # Show detected state with color
+        state_color = (0, 255, 0) if detected_state else (128, 128, 128)
+        state_text = f"Detected State: {detected_state}" if detected_state else "Detected State: None"
+        cv2.putText(sensor_data_viz, state_text, (10, y_offset + 120),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, state_color, 2)
+        
+        self.register_debug_output("frame_color_sensor_data", sensor_data_viz)
+        
+        return detected_state
     
     def is_available(self, image: np.ndarray) -> bool:
         """

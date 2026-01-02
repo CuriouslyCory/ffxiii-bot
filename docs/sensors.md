@@ -256,7 +256,7 @@ ROIs used by sensors should be registered in `StateManager` initialization (`src
 
 ```python
 # In StateManager.__init__()
-self.roi_cache.register_roi("minimap", (1375, 57, 320, 425))
+self.roi_cache.register_roi("minimap", (1375, 57, 425, 320))
 self.roi_cache.register_roi("my_roi", (x, y, width, height))
 ```
 

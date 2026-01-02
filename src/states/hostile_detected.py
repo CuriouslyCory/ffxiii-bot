@@ -26,7 +26,7 @@ class HostileDetectedState(State):
     ORIENTATION_STABILIZE_TIME = 0.2  # Wait time after orientation
     ACTION_COOLDOWN = 1.0  # Minimum time between action button presses (attack animation duration)
     ROTATION_STRAFE_AMOUNT = 0.5  # Strafe amount for rotation (0.0-1.0)
-    ROTATION_FORWARD_AMOUNT = 0.5  # Forward amount during rotation
+    ROTATION_FORWARD_AMOUNT = 0.35  # Forward amount during rotation
     
     def __init__(self, manager):
         """Initialize hostile detected state."""
@@ -84,7 +84,7 @@ class HostileDetectedState(State):
             # Press forward briefly to orient player with camera
             # Use movement skill to press forward (y > 0)
             print("[HOSTILE] Starting orientation phase - pressing forward")
-            self.movement_skill.move(0.0, 1.0)  # Forward
+            self.movement_skill.move(0.0, -1.0)  # Forward
             self._last_orientation_time = current_time
             self._oriented = True
             return  # Wait for next frame to stabilize
@@ -162,9 +162,11 @@ class HostileDetectedState(State):
                 # Need to turn left (counter-clockwise) - strafe left + forward
                 strafe = -self.ROTATION_STRAFE_AMOUNT * rotation_speed
                 self.movement_skill.move(strafe, forward)
+
+            print(f"[HOSTILE] Rotation speed: {rotation_speed:.2f}, Forward: {forward:.2f}, Strafe: {strafe:.2f}")
         else:
             # Within action angle threshold - move forward towards enemy
-            self.movement_skill.move(0.0, 1.0)  # Move forward
+            self.movement_skill.move(0.0, -1.0)  # Move forward
         
         # Attack when facing enemy (within threshold) and cooldown has passed
         if abs(angle_diff) <= self.ACTION_ANGLE_THRESHOLD:
