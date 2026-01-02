@@ -204,7 +204,7 @@ class Controller:
         Moves the character using the left joystick.
         """
         if not self.virtual_gamepad: return
-        print(f"[DEBUG CTRL] Move Char: x={x:.2f}, y={y:.2f}")
+        # print(f"[DEBUG CTRL] Move Char: x={x:.2f}, y={y:.2f}")
 
         # Standard Xbox 360 mapping:
         # Left Stick Y: -1.0 is Up (Forward), 1.0 is Down (Backward)

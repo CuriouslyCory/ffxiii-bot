@@ -5,18 +5,14 @@ Debug utility for testing sensors.
 Allows testing individual sensors with specific images or live screen capture.
 Shows sensor input (ROI) and results/telemetry data.
 
-Usage:
-    python src/debug-sensors.py [image_path]
-    
-    If image_path is provided (relative to templates/), loads that image.
-    Otherwise, uses live screen capture.
+Enhanced with filter parameter controls and debug output display.
 """
 import cv2
 import os
 import sys
 import argparse
 from pathlib import Path
-from typing import Dict, Optional, Any, Tuple
+from typing import Dict, Optional, Any, Tuple, List
 import numpy as np
 
 # Add project root to Python path for absolute imports
@@ -30,7 +26,420 @@ from src.sensors.health import HealthSensor
 from src.sensors.minimap import MinimapSensor
 from src.sensors.minimap_state import MinimapStateSensor
 from src.sensors.compass import CompassSensor
+from src.sensors.enemy_position import EnemyPositionSensor
+from src.sensors.player_direction import PlayerDirectionSensor
 from src.states.movement.constants import WINDOW_OFFSET, RESOLUTION
+from src.filters.base import Filter
+from src.filters.color import HSVFilter, BlueFilter, AlertFilter
+from src.filters.mask import EllipseMaskFilter, RectangleMaskFilter, CircleMaskFilter, ShapeFilter
+from src.filters.composite import CompositeFilter
+
+
+class FilterParameterController:
+    """
+    Manages filter parameter controls (trackbars, etc.) for debugging.
+    """
+    
+    def __init__(self):
+        """Initialize filter parameter controller."""
+        self.window_name = "Filter Parameters"
+        self.trackbar_values: Dict[str, Dict[str, int]] = {}
+        self.filter_references: Dict[str, Filter] = {}
+        self._trackbar_created = False
+    
+    def setup_filter_controls(self, filters: Dict[str, Filter], roi_image: Optional[np.ndarray]):
+        """
+        Set up filter parameter controls for registered filters.
+        
+        Args:
+            filters: Dictionary of filter names to Filter instances
+            roi_image: ROI image for determining mask parameter bounds (optional)
+        """
+        # Clear existing trackbars
+        if self._trackbar_created:
+            cv2.destroyWindow(self.window_name)
+            self._trackbar_created = False
+        
+        self.filter_references = filters
+        self.trackbar_values = {}
+        
+        if not filters:
+            return
+        
+        # Create window for trackbars
+        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self.window_name, 400, 600)
+        
+        y_pos = 10
+        for filter_name, filter_obj in filters.items():
+            y_pos = self._create_filter_controls(filter_name, filter_obj, y_pos, roi_image)
+            y_pos += 20  # Spacing between filters
+        
+        self._trackbar_created = True
+    
+    def _create_filter_controls(self, filter_name: str, filter_obj: Filter, y_pos: int, roi_image: Optional[np.ndarray]) -> int:
+        """
+        Create controls for a specific filter.
+        
+        Returns:
+            Next y position for controls
+        """
+        # Handle CompositeFilter - extract individual filters
+        if isinstance(filter_obj, CompositeFilter):
+            # For composite filters, we'll handle the individual filters
+            # For now, skip composite filters in parameter controls
+            # (they'll be handled by their component filters)
+            return y_pos
+        
+        # Handle HSV filters (HSVFilter, BlueFilter, AlertFilter)
+        if isinstance(filter_obj, (HSVFilter, BlueFilter)):
+            return self._create_hsv_controls(filter_name, filter_obj, y_pos)
+        elif isinstance(filter_obj, AlertFilter):
+            return self._create_alert_controls(filter_name, filter_obj, y_pos)
+        
+        # Handle mask filters
+        if isinstance(filter_obj, EllipseMaskFilter):
+            return self._create_ellipse_controls(filter_name, filter_obj, y_pos, roi_image)
+        elif isinstance(filter_obj, RectangleMaskFilter):
+            return self._create_rectangle_controls(filter_name, filter_obj, y_pos, roi_image)
+        elif isinstance(filter_obj, CircleMaskFilter):
+            return self._create_circle_controls(filter_name, filter_obj, y_pos, roi_image)
+        
+        return y_pos
+    
+    def _create_hsv_controls(self, filter_name: str, filter_obj: Filter, y_pos: int) -> int:
+        """Create HSV trackbar controls."""
+        prefix = f"{filter_name}_"
+        self.trackbar_values[filter_name] = {}
+        
+        # Get current values
+        lower = filter_obj.lower
+        upper = filter_obj.upper
+        
+        # Create trackbars for lower bounds (H, S, V)
+        cv2.createTrackbar(f"{prefix}H_lower", self.window_name, int(lower[0]), 179, lambda x: None)
+        cv2.createTrackbar(f"{prefix}S_lower", self.window_name, int(lower[1]), 255, lambda x: None)
+        cv2.createTrackbar(f"{prefix}V_lower", self.window_name, int(lower[2]), 255, lambda x: None)
+        
+        # Create trackbars for upper bounds (H, S, V)
+        cv2.createTrackbar(f"{prefix}H_upper", self.window_name, int(upper[0]), 179, lambda x: None)
+        cv2.createTrackbar(f"{prefix}S_upper", self.window_name, int(upper[1]), 255, lambda x: None)
+        cv2.createTrackbar(f"{prefix}V_upper", self.window_name, int(upper[2]), 255, lambda x: None)
+        
+        # Store initial values
+        self.trackbar_values[filter_name] = {
+            "H_lower": int(lower[0]),
+            "S_lower": int(lower[1]),
+            "V_lower": int(lower[2]),
+            "H_upper": int(upper[0]),
+            "S_upper": int(upper[1]),
+            "V_upper": int(upper[2]),
+        }
+        
+        return y_pos + 200  # Approximate height for 6 trackbars
+    
+    def _create_alert_controls(self, filter_name: str, filter_obj: AlertFilter, y_pos: int) -> int:
+        """Create AlertFilter trackbar controls (two HSV ranges)."""
+        prefix = f"{filter_name}_"
+        
+        # Range 1
+        cv2.createTrackbar(f"{prefix}R1_H_lower", self.window_name, int(filter_obj.lower1[0]), 179, lambda x: None)
+        cv2.createTrackbar(f"{prefix}R1_S_lower", self.window_name, int(filter_obj.lower1[1]), 255, lambda x: None)
+        cv2.createTrackbar(f"{prefix}R1_V_lower", self.window_name, int(filter_obj.lower1[2]), 255, lambda x: None)
+        cv2.createTrackbar(f"{prefix}R1_H_upper", self.window_name, int(filter_obj.upper1[0]), 179, lambda x: None)
+        cv2.createTrackbar(f"{prefix}R1_S_upper", self.window_name, int(filter_obj.upper1[1]), 255, lambda x: None)
+        cv2.createTrackbar(f"{prefix}R1_V_upper", self.window_name, int(filter_obj.upper1[2]), 255, lambda x: None)
+        
+        # Initialize trackbar values
+        self.trackbar_values[filter_name] = {
+            "R1_H_lower": int(filter_obj.lower1[0]), "R1_S_lower": int(filter_obj.lower1[1]), "R1_V_lower": int(filter_obj.lower1[2]),
+            "R1_H_upper": int(filter_obj.upper1[0]), "R1_S_upper": int(filter_obj.upper1[1]), "R1_V_upper": int(filter_obj.upper1[2]),
+        }
+        
+        return y_pos + 400  # Approximate height for 12 trackbars
+    
+    def _create_ellipse_controls(self, filter_name: str, filter_obj: EllipseMaskFilter, y_pos: int, roi_image: Optional[np.ndarray]) -> int:
+        """Create ellipse mask controls."""
+        prefix = f"{filter_name}_"
+        max_dim = 500
+        
+        if roi_image is not None:
+            h, w = roi_image.shape[:2]
+            max_dim = max(w, h)
+        
+        cv2.createTrackbar(f"{prefix}center_x", self.window_name, filter_obj.center[0], max_dim, lambda x: None)
+        cv2.createTrackbar(f"{prefix}center_y", self.window_name, filter_obj.center[1], max_dim, lambda x: None)
+        cv2.createTrackbar(f"{prefix}radius_x", self.window_name, filter_obj.axes[0], max_dim, lambda x: None)
+        cv2.createTrackbar(f"{prefix}radius_y", self.window_name, filter_obj.axes[1], max_dim, lambda x: None)
+        cv2.createTrackbar(f"{prefix}mask_inside", self.window_name, 1 if filter_obj.mask_inside else 0, 1, lambda x: None)
+        
+        # Initialize trackbar values
+        self.trackbar_values[filter_name] = {
+            "center_x": filter_obj.center[0],
+            "center_y": filter_obj.center[1],
+            "radius_x": filter_obj.axes[0],
+            "radius_y": filter_obj.axes[1],
+            "mask_inside": 1 if filter_obj.mask_inside else 0,
+        }
+        
+        return y_pos + 150
+    
+    def _create_rectangle_controls(self, filter_name: str, filter_obj: RectangleMaskFilter, y_pos: int, roi_image: Optional[np.ndarray]) -> int:
+        """Create rectangle mask controls."""
+        prefix = f"{filter_name}_"
+        max_dim = 500
+        
+        if roi_image is not None:
+            h, w = roi_image.shape[:2]
+            max_dim = max(w, h)
+        
+        width = filter_obj.bottom_right[0] - filter_obj.top_left[0]
+        height = filter_obj.bottom_right[1] - filter_obj.top_left[1]
+        cv2.createTrackbar(f"{prefix}x", self.window_name, filter_obj.top_left[0], max_dim, lambda x: None)
+        cv2.createTrackbar(f"{prefix}y", self.window_name, filter_obj.top_left[1], max_dim, lambda x: None)
+        cv2.createTrackbar(f"{prefix}width", self.window_name, width, max_dim, lambda x: None)
+        cv2.createTrackbar(f"{prefix}height", self.window_name, height, max_dim, lambda x: None)
+        cv2.createTrackbar(f"{prefix}mask_inside", self.window_name, 1 if filter_obj.mask_inside else 0, 1, lambda x: None)
+        
+        # Initialize trackbar values
+        self.trackbar_values[filter_name] = {
+            "x": filter_obj.top_left[0],
+            "y": filter_obj.top_left[1],
+            "width": width,
+            "height": height,
+            "mask_inside": 1 if filter_obj.mask_inside else 0,
+        }
+        
+        return y_pos + 150
+    
+    def _create_circle_controls(self, filter_name: str, filter_obj: CircleMaskFilter, y_pos: int, roi_image: Optional[np.ndarray]) -> int:
+        """Create circle mask controls."""
+        prefix = f"{filter_name}_"
+        max_dim = 500
+        
+        if roi_image is not None:
+            h, w = roi_image.shape[:2]
+            max_dim = max(w, h)
+        
+        cv2.createTrackbar(f"{prefix}center_x", self.window_name, filter_obj.center[0], max_dim, lambda x: None)
+        cv2.createTrackbar(f"{prefix}center_y", self.window_name, filter_obj.center[1], max_dim, lambda x: None)
+        cv2.createTrackbar(f"{prefix}radius", self.window_name, filter_obj.radius, max_dim, lambda x: None)
+        cv2.createTrackbar(f"{prefix}mask_inside", self.window_name, 1 if filter_obj.mask_inside else 0, 1, lambda x: None)
+        
+        # Initialize trackbar values
+        self.trackbar_values[filter_name] = {
+            "center_x": filter_obj.center[0],
+            "center_y": filter_obj.center[1],
+            "radius": filter_obj.radius,
+            "mask_inside": 1 if filter_obj.mask_inside else 0,
+        }
+        
+        return y_pos + 120
+    
+    def update_filter_parameters(self) -> bool:
+        """
+        Update filter parameters from trackbar values.
+        
+        Returns:
+            True if any parameters changed, False otherwise
+        """
+        if not self._trackbar_created:
+            return False
+        
+        changed = False
+        
+        for filter_name, filter_obj in self.filter_references.items():
+            if filter_name not in self.trackbar_values:
+                continue
+            
+            # Skip CompositeFilter
+            if isinstance(filter_obj, CompositeFilter):
+                continue
+            
+            values = self.trackbar_values[filter_name]
+            prefix = f"{filter_name}_"
+            
+            # Update HSV filters
+            if isinstance(filter_obj, (HSVFilter, BlueFilter)):
+                h_lower = cv2.getTrackbarPos(f"{prefix}H_lower", self.window_name)
+                s_lower = cv2.getTrackbarPos(f"{prefix}S_lower", self.window_name)
+                v_lower = cv2.getTrackbarPos(f"{prefix}V_lower", self.window_name)
+                h_upper = cv2.getTrackbarPos(f"{prefix}H_upper", self.window_name)
+                s_upper = cv2.getTrackbarPos(f"{prefix}S_upper", self.window_name)
+                v_upper = cv2.getTrackbarPos(f"{prefix}V_upper", self.window_name)
+                
+                if (values.get("H_lower") != h_lower or values.get("S_lower") != s_lower or
+                    values.get("V_lower") != v_lower or values.get("H_upper") != h_upper or
+                    values.get("S_upper") != s_upper or values.get("V_upper") != v_upper):
+                    filter_obj.lower = np.array([h_lower, s_lower, v_lower])
+                    filter_obj.upper = np.array([h_upper, s_upper, v_upper])
+                    values.update({"H_lower": h_lower, "S_lower": s_lower, "V_lower": v_lower,
+                                 "H_upper": h_upper, "S_upper": s_upper, "V_upper": v_upper})
+                    changed = True
+            
+            # Update AlertFilter
+            elif isinstance(filter_obj, AlertFilter):
+                r1_h_lower = cv2.getTrackbarPos(f"{prefix}R1_H_lower", self.window_name)
+                r1_s_lower = cv2.getTrackbarPos(f"{prefix}R1_S_lower", self.window_name)
+                r1_v_lower = cv2.getTrackbarPos(f"{prefix}R1_V_lower", self.window_name)
+                r1_h_upper = cv2.getTrackbarPos(f"{prefix}R1_H_upper", self.window_name)
+                r1_s_upper = cv2.getTrackbarPos(f"{prefix}R1_S_upper", self.window_name)
+                r1_v_upper = cv2.getTrackbarPos(f"{prefix}R1_V_upper", self.window_name)
+                
+                # Check if values changed
+                if (values.get("R1_H_lower") != r1_h_lower or values.get("R1_S_lower") != r1_s_lower or
+                    values.get("R1_V_lower") != r1_v_lower or values.get("R1_H_upper") != r1_h_upper or
+                    values.get("R1_S_upper") != r1_s_upper or values.get("R1_V_upper") != r1_v_upper):
+                    filter_obj.lower1 = np.array([r1_h_lower, r1_s_lower, r1_v_lower])
+                    filter_obj.upper1 = np.array([r1_h_upper, r1_s_upper, r1_v_upper])
+                    values.update({
+                        "R1_H_lower": r1_h_lower, "R1_S_lower": r1_s_lower, "R1_V_lower": r1_v_lower,
+                        "R1_H_upper": r1_h_upper, "R1_S_upper": r1_s_upper, "R1_V_upper": r1_v_upper,
+                    })
+                    changed = True
+            
+            # Update EllipseMaskFilter
+            elif isinstance(filter_obj, EllipseMaskFilter):
+                center_x = cv2.getTrackbarPos(f"{prefix}center_x", self.window_name)
+                center_y = cv2.getTrackbarPos(f"{prefix}center_y", self.window_name)
+                radius_x = cv2.getTrackbarPos(f"{prefix}radius_x", self.window_name)
+                radius_y = cv2.getTrackbarPos(f"{prefix}radius_y", self.window_name)
+                mask_inside_val = cv2.getTrackbarPos(f"{prefix}mask_inside", self.window_name)
+                mask_inside = mask_inside_val > 0
+                
+                # Check if values changed
+                if (values.get("center_x") != center_x or values.get("center_y") != center_y or
+                    values.get("radius_x") != radius_x or values.get("radius_y") != radius_y or
+                    values.get("mask_inside") != mask_inside_val):
+                    filter_obj.center = (center_x, center_y)
+                    filter_obj.axes = (radius_x, radius_y)
+                    filter_obj.mask_inside = mask_inside
+                    values.update({
+                        "center_x": center_x,
+                        "center_y": center_y,
+                        "radius_x": radius_x,
+                        "radius_y": radius_y,
+                        "mask_inside": mask_inside_val,
+                    })
+                    changed = True
+            
+            # Update RectangleMaskFilter
+            elif isinstance(filter_obj, RectangleMaskFilter):
+                x = cv2.getTrackbarPos(f"{prefix}x", self.window_name)
+                y = cv2.getTrackbarPos(f"{prefix}y", self.window_name)
+                width = cv2.getTrackbarPos(f"{prefix}width", self.window_name)
+                height = cv2.getTrackbarPos(f"{prefix}height", self.window_name)
+                mask_inside_val = cv2.getTrackbarPos(f"{prefix}mask_inside", self.window_name)
+                mask_inside = mask_inside_val > 0
+                
+                # Check if values changed
+                if (values.get("x") != x or values.get("y") != y or
+                    values.get("width") != width or values.get("height") != height or
+                    values.get("mask_inside") != mask_inside_val):
+                    filter_obj.top_left = (x, y)
+                    filter_obj.bottom_right = (x + width, y + height)
+                    filter_obj.mask_inside = mask_inside
+                    values.update({
+                        "x": x,
+                        "y": y,
+                        "width": width,
+                        "height": height,
+                        "mask_inside": mask_inside_val,
+                    })
+                    changed = True
+            
+            # Update CircleMaskFilter
+            elif isinstance(filter_obj, CircleMaskFilter):
+                center_x = cv2.getTrackbarPos(f"{prefix}center_x", self.window_name)
+                center_y = cv2.getTrackbarPos(f"{prefix}center_y", self.window_name)
+                radius = cv2.getTrackbarPos(f"{prefix}radius", self.window_name)
+                mask_inside_val = cv2.getTrackbarPos(f"{prefix}mask_inside", self.window_name)
+                mask_inside = mask_inside_val > 0
+                
+                # Check if values changed
+                if (values.get("center_x") != center_x or values.get("center_y") != center_y or
+                    values.get("radius") != radius or values.get("mask_inside") != mask_inside_val):
+                    filter_obj.center = (center_x, center_y)
+                    filter_obj.radius = radius
+                    filter_obj.mask_inside = mask_inside
+                    values.update({
+                        "center_x": center_x,
+                        "center_y": center_y,
+                        "radius": radius,
+                        "mask_inside": mask_inside_val,
+                    })
+                    changed = True
+        
+        return changed
+    
+    def cleanup(self):
+        """Clean up filter parameter controls."""
+        if self._trackbar_created:
+            cv2.destroyWindow(self.window_name)
+            self._trackbar_created = False
+
+
+def create_debug_outputs_display(debug_outputs: Dict[str, np.ndarray], max_width: int = 400) -> Optional[np.ndarray]:
+    """
+    Create a grid display of debug output images.
+    
+    Args:
+        debug_outputs: Dictionary mapping labels to debug images
+        max_width: Maximum width for each image in the grid
+        
+    Returns:
+        Composite image showing all debug outputs, or None if no outputs
+    """
+    if not debug_outputs:
+        return None
+    
+    # Resize all images to consistent size
+    resized_images = []
+    labels = list(debug_outputs.keys())
+    
+    for label in labels:
+        img = debug_outputs[label]
+        h, w = img.shape[:2]
+        scale = min(max_width / w, max_width / h, 1.0)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        resized = cv2.resize(img, (new_w, new_h))
+        resized_images.append((label, resized))
+    
+    # Determine grid layout (2 columns)
+    num_images = len(resized_images)
+    cols = 2
+    rows = (num_images + cols - 1) // cols
+    
+    # Find maximum dimensions
+    max_h = max(img.shape[0] for _, img in resized_images)
+    max_w = max(img.shape[1] for _, img in resized_images)
+    
+    # Create canvas
+    canvas_h = rows * (max_h + 30)  # +30 for label text
+    canvas_w = cols * (max_w + 20)
+    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+    
+    # Place images in grid
+    for idx, (label, img) in enumerate(resized_images):
+        row = idx // cols
+        col = idx % cols
+        
+        y_offset = row * (max_h + 30)
+        x_offset = col * (max_w + 20)
+        
+        # Place image
+        img_h, img_w = img.shape[:2]
+        y_start = y_offset + 25  # Leave space for label
+        x_start = x_offset + (max_w - img_w) // 2  # Center horizontally
+        
+        canvas[y_start:y_start + img_h, x_start:x_start + img_w] = img
+        
+        # Add label
+        cv2.putText(canvas, label, (x_offset + 5, y_offset + 15),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    
+    return canvas
 
 
 class SensorTester:
@@ -38,6 +447,7 @@ class SensorTester:
     Utility for testing sensors with images.
     
     Provides interactive selection of sensors and displays ROI input and results.
+    Enhanced with filter parameter controls and debug output display.
     """
     
     def __init__(self, vision: VisionEngine, roi_cache: ROICache):
@@ -52,6 +462,7 @@ class SensorTester:
         self.roi_cache = roi_cache
         self.sensors: Dict[str, Sensor] = {}
         self.current_sensor: Optional[Sensor] = None
+        self.filter_controller = FilterParameterController()
         self._initialize_sensors()
     
     def _initialize_sensors(self):
@@ -73,6 +484,12 @@ class SensorTester:
         # Compass Sensor (needs vision engine)
         self.sensors["CompassSensor"] = CompassSensor(self.vision)
         
+        # Enemy Position Sensor (uses ROI cache)
+        self.sensors["EnemyPositionSensor"] = EnemyPositionSensor(self.roi_cache)
+        
+        # Player Direction Sensor (uses ROI cache)
+        self.sensors["PlayerDirectionSensor"] = PlayerDirectionSensor(self.roi_cache)
+        
         # Enable all sensors by default for testing
         for sensor in self.sensors.values():
             sensor.enable()
@@ -81,18 +498,24 @@ class SensorTester:
         """Get list of available sensor names."""
         return list(self.sensors.keys())
     
-    def select_sensor(self, sensor_name: str) -> bool:
+    def select_sensor(self, sensor_name: str, roi_image: Optional[np.ndarray] = None) -> bool:
         """
         Select a sensor by name.
         
         Args:
             sensor_name: Name of the sensor to select
+            roi_image: Optional ROI image for setting up filter controls
             
         Returns:
             True if sensor was found and selected, False otherwise
         """
         if sensor_name in self.sensors:
             self.current_sensor = self.sensors[sensor_name]
+            
+            # Set up filter controls for this sensor
+            registered_filters = self.current_sensor.get_registered_filters()
+            self.filter_controller.setup_filter_controls(registered_filters, roi_image)
+            
             return True
         return False
     
@@ -116,6 +539,16 @@ class SensorTester:
             roi_image = self.roi_cache.get_roi("minimap", image)
             if roi_image is not None:
                 return (roi_image, "minimap ROI")
+        
+        if isinstance(sensor, EnemyPositionSensor):
+            roi_image = self.roi_cache.get_roi("minimap", image)
+            if roi_image is not None:
+                return (roi_image, "minimap ROI")
+        
+        if isinstance(sensor, PlayerDirectionSensor):
+            roi_image = self.roi_cache.get_roi("minimap_center_arrow", image)
+            if roi_image is not None:
+                return (roi_image, "minimap center arrow ROI")
         
         # Handle sensors with explicit ROI
         if isinstance(sensor, HealthSensor):
@@ -147,13 +580,16 @@ class SensorTester:
         if not sensor:
             return None, None
         
+        # Update filter parameters from trackbars
+        self.filter_controller.update_filter_parameters()
+        
         # Get ROI input
         roi_info = self.get_sensor_input_roi(image, sensor_name)
         roi_image = roi_info[0] if roi_info else None
         
         # Run sensor (sensors read from full image, not ROI)
         result = sensor.read(image)
-        print(f"Sensor: {sensor_name}, Result: {result}, ROI: {roi_image.shape if roi_image is not None else 'None'}")
+        # print(f"Sensor: {sensor_name}, Result: {result}, ROI: {roi_image.shape if roi_image is not None else 'None'}")
         
         return result, roi_image
 
@@ -347,7 +783,8 @@ def main():
     # Configuration: Uses constants from src/states/movement/constants.py
     vision = VisionEngine(window_offset=WINDOW_OFFSET, resolution=RESOLUTION)
     roi_cache = ROICache(vision)
-    roi_cache.register_roi("minimap", (1375, 57, 425, 320))
+    roi_cache.register_roi("minimap", (1375, 57, 320, 425))
+    roi_cache.register_roi("minimap_center_arrow", (1575, 203, 30, 30))
     
     # Load templates that sensors might need
     template_dir = "templates"
@@ -379,6 +816,10 @@ def main():
     
     print_menu(sensor_tester, current_image_path)
     
+    # Track last displayed state for auto-refresh
+    last_display_time = 0
+    auto_refresh_delay = 100  # milliseconds between auto-refreshes
+    
     try:
         while True:
             if use_live_capture:
@@ -388,7 +829,40 @@ def main():
             if use_live_capture:
                 key = cv2.waitKey(1) & 0xFF
             else:
-                key = cv2.waitKey(0) & 0xFF
+                key = cv2.waitKey(1) & 0xFF  # Use non-blocking for trackbar responsiveness
+            
+            # Check if filter parameters changed and auto-refresh if sensor is selected
+            if sensor_tester.current_sensor is not None and current_image is not None:
+                filter_changed = sensor_tester.filter_controller.update_filter_parameters()
+                if filter_changed:
+                    # Auto-refresh: re-test sensor with updated filters
+                    sensor_name = None
+                    for name, sensor in sensor_tester.sensors.items():
+                        if sensor == sensor_tester.current_sensor:
+                            sensor_name = name
+                            break
+                    
+                    if sensor_name:
+                        roi_cache.clear_cache()
+                        result, roi_image = sensor_tester.test_sensor(current_image, sensor_name)
+                        roi_info = sensor_tester.get_sensor_input_roi(current_image, sensor_name)
+                        roi_label = roi_info[1] if roi_info else "N/A"
+                        
+                        roi_coords = None
+                        if sensor_name == "MinimapStateSensor":
+                            roi_coords = roi_cache.get_coords("minimap")
+                        
+                        display_img = create_display_image(
+                            current_image, roi_image, roi_label, sensor_name, result, roi_coords
+                        )
+                        cv2.imshow("Sensor Test Result", display_img)
+                        
+                        # Display debug outputs if available
+                        debug_outputs = sensor_tester.current_sensor.get_debug_outputs()
+                        if debug_outputs:
+                            debug_display = create_debug_outputs_display(debug_outputs)
+                            if debug_display is not None:
+                                cv2.imshow("Debug Outputs", debug_display)
             
             # Handle key presses
             if key == ord('q'):
@@ -419,7 +893,7 @@ def main():
                 print("Switched to live capture mode")
                 print_menu(sensor_tester, current_image_path)
             elif key == ord('t'):
-                # Test selected sensor
+                # Test selected sensor (manual refresh)
                 if sensor_tester.current_sensor is None:
                     print("No sensor selected. Select a sensor first.")
                     continue
@@ -435,6 +909,9 @@ def main():
                         break
                 
                 if sensor_name:
+                    # Update filter parameters first
+                    sensor_tester.filter_controller.update_filter_parameters()
+                    
                     # Clear ROI cache before testing to ensure fresh extraction
                     roi_cache.clear_cache()
                     result, roi_image = sensor_tester.test_sensor(current_image, sensor_name)
@@ -451,6 +928,13 @@ def main():
                     )
                     cv2.imshow("Sensor Test Result", display_img)
                     
+                    # Display debug outputs if available
+                    debug_outputs = sensor_tester.current_sensor.get_debug_outputs()
+                    if debug_outputs:
+                        debug_display = create_debug_outputs_display(debug_outputs)
+                        if debug_display is not None:
+                            cv2.imshow("Debug Outputs", debug_display)
+                    
                     print(f"\nSensor: {sensor_name}")
                     print(f"Result: {format_sensor_result(sensor_name, result)}")
             elif ord('1') <= key <= ord('9'):
@@ -459,7 +943,12 @@ def main():
                 sensors = sensor_tester.list_sensors()
                 if 0 <= sensor_idx < len(sensors):
                     sensor_name = sensors[sensor_idx]
-                    if sensor_tester.select_sensor(sensor_name):
+                    # Get ROI image for filter control setup
+                    roi_info = None
+                    if current_image is not None:
+                        roi_info = sensor_tester.get_sensor_input_roi(current_image, sensor_name)
+                    roi_image = roi_info[0] if roi_info else None
+                    if sensor_tester.select_sensor(sensor_name, roi_image):
                         print(f"Selected sensor: {sensor_name}")
                         print_menu(sensor_tester, current_image_path)
                     else:
@@ -467,11 +956,11 @@ def main():
             
             # Display current image if available
             if current_image is not None:
-                # Show a simple preview in live mode
-                if use_live_capture:
+                # Show a simple preview in live mode or when no sensor selected
+                if use_live_capture and sensor_tester.current_sensor is None:
                     preview = cv2.resize(current_image, (640, 360))
                     cv2.imshow("Live Preview (press 't' to test sensor)", preview)
-                elif sensor_tester.current_sensor is None:
+                elif not use_live_capture and sensor_tester.current_sensor is None:
                     # Show full image when no sensor selected
                     display = cv2.resize(current_image, (960, 540))
                     cv2.imshow("Image Preview", display)
@@ -483,6 +972,7 @@ def main():
         import traceback
         traceback.print_exc()
     finally:
+        sensor_tester.filter_controller.cleanup()
         cv2.destroyAllWindows()
 
 

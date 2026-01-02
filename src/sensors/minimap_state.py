@@ -6,6 +6,9 @@ import numpy as np
 import cv2
 from .base import Sensor
 from src.core.roi_cache import ROICache
+from src.filters.mask import EllipseMaskFilter
+from src.filters.color import HSVFilter, AlertFilter, BlueFilter
+from src.filters.composite import CompositeFilter
 
 
 class MinimapStateSensor(Sensor):
@@ -14,6 +17,15 @@ class MinimapStateSensor(Sensor):
     
     Detects if the minimap frame is blue (movement state) or red (hostile_detected state)
     by analyzing the frame border color using HSV color space.
+    
+    First verifies that a minimap template match exists before checking colors,
+    to avoid false positives from blue sky or red lava. Template matching uses the
+    same mask and grayscale preprocessing as color detection for consistency.
+    
+    Uses composable filters:
+    - minimap_frame: Masks to isolate the border region (outer ellipse - inner ellipse)
+    - minimap_detected: minimap_frame + blue color filter (movement state)
+    - minimap_hostile_detected: minimap_frame + red/alert color filter (hostile_detected state)
     """
     
     def __init__(self, roi_cache: ROICache):
@@ -26,16 +38,77 @@ class MinimapStateSensor(Sensor):
         super().__init__("Minimap State Sensor", "Detects minimap frame color (blue/red) for state detection")
         self.roi_cache = roi_cache
         
-        # Blue filter HSV ranges (movement state)
-        self.blue_lower = np.array([84, 75, 100])
-        self.blue_upper = np.array([97, 245, 245])
+        # Default minimap dimensions (320x425)
+        # These will be adjusted based on actual ROI size in _detect_frame_color
+        self._setup_filters()
+    
+    def _setup_filters(self, width: int = 430, height: int = 320):
+        """
+        Set up filter pipelines for minimap processing.
         
-        # Red/Alert filter HSV ranges (hostile_detected state)
-        # Two ranges for HSV wheel wrap
-        self.red_lower1 = np.array([0, 40, 50])
-        self.red_upper1 = np.array([13, 255, 255])
-        self.red_lower2 = np.array([170, 40, 50])
-        self.red_upper2 = np.array([180, 255, 255])
+        Args:
+            width: Width of minimap ROI
+            height: Height of minimap ROI
+        """
+        center_x, center_y = 215, 160 # width // 2, height // 2
+        radius_x, radius_y = 212, 160 # width // 2, height // 2
+        
+        # Inner ellipse radius (to exclude center, keeping only border)
+        # Use ~70% of radius to focus on outer 30% border region
+        inner_radius_x = 181 #int(radius_x * 0.7)
+        inner_radius_y = 131 #int(radius_y * 0.7)
+        
+        # Create outer ellipse mask (keep inside)
+        outer_mask = EllipseMaskFilter(
+            center=(center_x, center_y),
+            axes=(radius_x, radius_y),
+            mask_inside=True,
+            name="Minimap Outer Mask"
+        )
+        
+        # Create inner ellipse mask (keep outside = mask inside)
+        inner_mask = EllipseMaskFilter(
+            center=(center_x, center_y),
+            axes=(inner_radius_x, inner_radius_y),
+            mask_inside=False,  # Keep outside (border region)
+            name="Minimap Inner Mask"
+        )
+        
+        # Create minimap_frame filter: outer mask then inner mask (progressive)
+        # This results in: outer ellipse - inner ellipse = border region
+        minimap_frame = CompositeFilter(
+            [outer_mask, inner_mask],
+            mode="progressive",
+            name="Minimap Frame",
+            description="Isolates minimap border region using nested ellipses"
+        )
+        self.register_filter("minimap_frame", minimap_frame)
+        
+        # Create blue detection filter: minimap_frame + blue color filter
+        blue_filter = BlueFilter()
+        minimap_detected = CompositeFilter(
+            [minimap_frame, blue_filter],
+            mode="progressive",
+            name="Minimap Detected (Blue)",
+            description="Minimap border filtered for blue (movement state)"
+        )
+        self.register_filter("minimap_detected", minimap_detected)
+        
+        # Create red/alert detection filter: minimap_frame + alert color filter
+        alert_filter = AlertFilter()
+        minimap_hostile_detected = CompositeFilter(
+            [minimap_frame, alert_filter],
+            mode="progressive",
+            name="Minimap Hostile Detected (Red)",
+            description="Minimap border filtered for red/alert (hostile_detected state)"
+        )
+        self.register_filter("minimap_hostile_detected", minimap_hostile_detected)
+        
+        # Store mask filters for potential parameter adjustment
+        self.register_filter("outer_mask", outer_mask)
+        self.register_filter("inner_mask", inner_mask)
+        self.register_filter("blue_filter", blue_filter)
+        self.register_filter("alert_filter", alert_filter)
     
     def read(self, image: np.ndarray) -> Optional[str]:
         """
@@ -52,16 +125,104 @@ class MinimapStateSensor(Sensor):
         if not self.is_enabled:
             return None
         
+        # Clear debug outputs from previous frame
+        self.clear_debug_outputs()
+        
         # Get cached minimap ROI
         minimap_roi = self.roi_cache.get_roi("minimap", image)
         if minimap_roi is None:
             return None
         
+        # Update filter dimensions if ROI size changed
+        h, w = minimap_roi.shape[:2]
+        # Re-setup filters if dimensions changed (this is a simple approach;
+        # in production, filters might need to be more dynamic)
+        if not hasattr(self, '_last_width') or self._last_width != w or self._last_height != h:
+            self._setup_filters(width=w, height=h)
+            self._last_width = w
+            self._last_height = h
+        
+        # First verify we're actually looking at a minimap before checking colors
+        if not self._detect_minimap(minimap_roi):
+            return None
+        
         return self._detect_frame_color(minimap_roi)
+    
+    def _detect_minimap(self, minimap_image: np.ndarray) -> bool:
+        """
+        Detect if the ROI actually contains a minimap by template matching.
+        
+        Uses the same mask and grayscale preprocessing for both the ROI and template
+        to ensure consistent matching. This prevents false positives from blue sky
+        or red lava that might match color filters.
+        
+        Args:
+            minimap_image: Extracted minimap ROI image
+            
+        Returns:
+            True if minimap template is detected, False otherwise
+        """
+        # Get the minimap_frame filter (same masks used in color detection)
+        minimap_frame_filter = self._registered_filters.get("minimap_frame")
+        if not minimap_frame_filter:
+            # If filters aren't set up, can't verify minimap - return True to allow color check
+            return True
+        
+        # Apply the same mask to the ROI image
+        masked_roi = minimap_frame_filter.apply(minimap_image)
+        
+        # Convert to grayscale
+        roi_gray = cv2.cvtColor(masked_roi, cv2.COLOR_BGR2GRAY)
+        
+        # Get template if available
+        if not hasattr(self.roi_cache, 'vision') or not self.roi_cache.vision:
+            # Vision engine not available - can't verify, allow color check
+            return True
+        
+        vision = self.roi_cache.vision
+        if "minimap_outline" not in vision.templates:
+            # Template not loaded - can't verify, allow color check
+            return True
+        
+        template = vision.templates["minimap_outline"]
+        
+        # Resize template to match ROI dimensions if needed
+        h, w = minimap_image.shape[:2]
+        template_h, template_w = template.shape[:2]
+        
+        # If template is larger than ROI, we can't match it
+        if template_h > h or template_w > w:
+            print("Template is larger than ROI, can't match it")
+            return False
+        
+        # Apply the same mask and grayscale to template
+        # First resize template to ROI size if different
+        if template_h != h or template_w != w:
+            template_resized = cv2.resize(template, (w, h), interpolation=cv2.INTER_LINEAR)
+        else:
+            template_resized = template
+        
+        # Apply the same minimap_frame mask to template
+        masked_template = minimap_frame_filter.apply(template_resized)
+        
+        # Convert to grayscale
+        template_gray = cv2.cvtColor(masked_template, cv2.COLOR_BGR2GRAY)
+        
+        # Check for match using template matching
+        # Since both images are already masked and grayscale, we can use normalized correlation
+        result = cv2.matchTemplate(roi_gray, template_gray, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, _ = cv2.minMaxLoc(result)
+        
+        # Use threshold of 0.7 as it should be a high confidence match
+        threshold = 0.3
+        return max_val >= threshold
     
     def _detect_frame_color(self, minimap_image: np.ndarray) -> Optional[str]:
         """
         Detect frame color by analyzing the border region of the minimap.
+        
+        Uses registered filters to process the minimap and register debug outputs.
+        Should only be called after _detect_minimap confirms a minimap is present.
         
         Args:
             minimap_image: Extracted minimap ROI image
@@ -69,45 +230,40 @@ class MinimapStateSensor(Sensor):
         Returns:
             "movement", "hostile_detected", or None
         """
-        h, w = minimap_image.shape[:2]
         
-        # Convert to HSV
-        hsv = cv2.cvtColor(minimap_image, cv2.COLOR_BGR2HSV)
+        # Get registered filters
+        minimap_frame_filter = self._registered_filters.get("minimap_frame")
+        minimap_detected_filter = self._registered_filters.get("minimap_detected")
+        minimap_hostile_detected_filter = self._registered_filters.get("minimap_hostile_detected")
         
-        # Create mask for frame border region
-        # The minimap is elliptical (320x425), so we create an elliptical mask
-        # that excludes the center region to focus on the frame border
-        center_x, center_y = w // 2, h // 2
-        radius_x, radius_y = w // 2, h // 2
+        if not minimap_frame_filter or not minimap_detected_filter or not minimap_hostile_detected_filter:
+            # Fallback to old logic if filters not set up
+            return None
         
-        # Inner ellipse radius (to exclude center, keeping only border)
-        # Use ~70% of radius to focus on outer 30% border region
-        inner_radius_x = int(radius_x * 0.7)
-        inner_radius_y = int(radius_y * 0.7)
+        # Apply minimap_frame filter to get masked border region
+        masked_frame = minimap_frame_filter.apply(minimap_image)
+        self.register_debug_output("masked_frame", masked_frame)
         
-        # Create mask for outer border region
-        border_mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.ellipse(border_mask, (center_x, center_y), (radius_x, radius_y), 0, 0, 360, 255, -1)
-        inner_mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.ellipse(inner_mask, (center_x, center_y), (inner_radius_x, inner_radius_y), 0, 0, 360, 255, -1)
-        border_mask = cv2.subtract(border_mask, inner_mask)
+        # Apply blue filter to get blue pixels in border
+        blue_filtered = minimap_detected_filter.apply(minimap_image)
+        self.register_debug_output("blue_filtered", blue_filtered)
         
-        # Apply mask to HSV image to get only border pixels
-        masked_hsv = cv2.bitwise_and(hsv, hsv, mask=border_mask)
+        # Apply red/alert filter to get red pixels in border
+        red_filtered = minimap_hostile_detected_filter.apply(minimap_image)
+        self.register_debug_output("red_filtered", red_filtered)
         
-        # Count blue pixels
-        blue_mask = cv2.inRange(masked_hsv, self.blue_lower, self.blue_upper)
-        blue_count = np.count_nonzero(blue_mask)
+        # Count pixels in filtered results
+        # Convert to grayscale and count non-zero pixels
+        blue_gray = cv2.cvtColor(blue_filtered, cv2.COLOR_BGR2GRAY)
+        blue_count = np.count_nonzero(blue_gray)
         
-        # Count red pixels (combine both ranges)
-        red_mask1 = cv2.inRange(masked_hsv, self.red_lower1, self.red_upper1)
-        red_mask2 = cv2.inRange(masked_hsv, self.red_lower2, self.red_upper2)
-        red_mask = cv2.bitwise_or(red_mask1, red_mask2)
-        red_count = np.count_nonzero(red_mask)
+        red_gray = cv2.cvtColor(red_filtered, cv2.COLOR_BGR2GRAY)
+        red_count = np.count_nonzero(red_gray)
         
-        # Determine state based on dominant color
-        # Use a threshold to avoid false positives (need at least some pixels)
-        total_border_pixels = np.count_nonzero(border_mask)
+        # Count total border pixels from masked frame
+        masked_gray = cv2.cvtColor(masked_frame, cv2.COLOR_BGR2GRAY)
+        total_border_pixels = np.count_nonzero(masked_gray)
+        
         if total_border_pixels == 0:
             return None
         

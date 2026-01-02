@@ -23,9 +23,19 @@ Each state (e.g., `BattleState`, `MovementState`) defines its own `is_active` lo
 ### 3. Image Filters (`src/filters/*.py`)
 The bot uses a composable filter system for image processing:
 - **Color Filters**: HSV-based filters for isolating specific color ranges (blue, gold, red/alert)
+  - `HSVFilter`: Generic HSV color range filter with configurable bounds
+  - `BlueFilter`, `AlertFilter`, `GoldFilter`: Pre-configured filters for common colors
+- **Mask Filters**: Geometric shape-based masking filters
+  - `EllipseMaskFilter`: Elliptical masks with configurable center, axes, and inside/outside flag
+  - `RectangleMaskFilter`: Rectangular masks with configurable bounds
+  - `CircleMaskFilter`: Circular masks with configurable center and radius
 - **Edge Filters**: Canny and edge detection filters for feature extraction
-- **Composite Filters**: Chain multiple filters together with additive (union) or progressive (intersection) composition
+- **Composite Filters**: Chain multiple filters together with two composition modes:
+  - **Progressive** (sequential): Apply filters in order (e.g., mask then color = masked color filter)
+  - **Additive** (union): Combine filter results with OR operation (e.g., blue + gold = both visible)
+- **Filter Registry**: Global registry (`FilterRegistry`) for reusable filter pipelines
 - Filters are reusable and can be applied to any image processing pipeline
+- Sensors can register filters for debugging and interactive parameter adjustment
 
 ### 4. Sensors (`src/sensors/*.py`)
 Sensors provide state-specific detection capabilities:
@@ -114,5 +124,20 @@ To add a new sensor:
 To add a new filter:
 1. **Create Filter**: Subclass `Filter` in `src/filters/` implementing `apply()` method.
 2. **Compose Filters**: Use `CompositeFilter` to chain multiple filters together.
-3. **Reuse**: Filters are reusable across different image processing pipelines.
+3. **Register Filters**: Use `FilterRegistry.register_filter()` for global reuse, or `Sensor.register_filter()` for sensor-specific filters.
+4. **Reuse**: Filters are reusable across different image processing pipelines.
+
+Example filter composition:
+```python
+from src.filters.mask import EllipseMaskFilter
+from src.filters.color import BlueFilter
+from src.filters.composite import CompositeFilter
+
+# Create mask
+mask = EllipseMaskFilter(center=(100, 100), axes=(50, 50), mask_inside=True)
+
+# Compose mask + color filter
+pipeline = CompositeFilter([mask, BlueFilter()], mode="progressive")
+result = pipeline.apply(image)
+```
 

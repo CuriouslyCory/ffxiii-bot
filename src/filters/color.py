@@ -57,8 +57,8 @@ class BlueFilter(Filter):
         """Initialize blue filter with default HSV ranges."""
         super().__init__("Blue Filter", "Filters for blue minimap features")
         # Blue filter (normal minimap state)
-        self.lower = np.array([84, 75, 100])
-        self.upper = np.array([97, 245, 245])
+        self.lower = np.array([90, 81, 72])
+        self.upper = np.array([108, 245, 255])
     
     def apply(self, image: np.ndarray) -> np.ndarray:
         """
@@ -114,10 +114,9 @@ class AlertFilter(Filter):
         """Initialize alert filter with default HSV ranges."""
         super().__init__("Alert Filter", "Filters for red/alert minimap features")
         # Alert/Red filter (enemy nearby state - two ranges for HSV wheel wrap)
-        self.lower1 = np.array([0, 40, 50])
-        self.upper1 = np.array([13, 255, 255])
-        self.lower2 = np.array([170, 40, 50])
-        self.upper2 = np.array([180, 255, 255])
+        self.lower1 = np.array([0, 26, 140])
+        self.upper1 = np.array([12, 255, 255])
+
     
     def apply(self, image: np.ndarray) -> np.ndarray:
         """
@@ -131,9 +130,7 @@ class AlertFilter(Filter):
         """
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         mask1 = cv2.inRange(hsv, self.lower1, self.upper1)
-        mask2 = cv2.inRange(hsv, self.lower2, self.upper2)
-        mask = cv2.bitwise_or(mask1, mask2)
-        result = cv2.bitwise_and(image, image, mask=mask)
+        result = cv2.bitwise_and(image, image, mask=mask1)
         return result
 
 
