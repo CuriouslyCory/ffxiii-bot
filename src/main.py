@@ -28,10 +28,11 @@ def main():
     # These images must be provided by the user for the bot to function correctly.
     template_dir = "templates"
     required_templates = [
-        "minimap_outline.png",
         "paradigm_shift.png",
         "hp_container.png",
-        "battle_results.png"
+        "battle_results.png",
+        "minimap_outline.png",
+        "hostile_clock.png"
     ]
     
     print("--- FFXIII Automation Bot ---")
@@ -60,9 +61,9 @@ def main():
     # Register game states
     # Note: MovementState is checked last as a fallback, only after other states fail to match
     # (HostileDetectedState uses red frame vs MovementState's blue frame minimap detection)
-    manager.add_state(HostileDetectedState(manager))
     manager.add_state(BattleState(manager))
     manager.add_state(ResultsState(manager))
+    manager.add_state(HostileDetectedState(manager))
     manager.add_state(MovementState(manager))
     
     print("\nBot initialized. Ready to run.")

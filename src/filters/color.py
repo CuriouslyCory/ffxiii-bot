@@ -57,8 +57,8 @@ class BlueFilter(Filter):
         """Initialize blue filter with default HSV ranges."""
         super().__init__("Blue Filter", "Filters for blue minimap features")
         # Blue filter (normal minimap state)
-        self.lower = np.array([90, 1, 72])
-        self.upper = np.array([108, 245, 255])
+        self.lower = gimp_2_opencv(180, 54, 53)
+        self.upper = gimp_2_opencv(180, 100, 100)
     
     def apply(self, image: np.ndarray) -> np.ndarray:
         """
@@ -114,8 +114,8 @@ class AlertFilter(Filter):
         """Initialize alert filter with default HSV ranges."""
         super().__init__("Alert Filter", "Filters for red/alert minimap features")
         # Alert/Red filter (enemy nearby state - two ranges for HSV wheel wrap)
-        self.lower1 = np.array([0, 9, 69])
-        self.upper1 = np.array([18, 255, 255])
+        self.lower1 = np.array([0, 40, 60])
+        self.upper1 = np.array([13, 255, 255])
 
     
     def apply(self, image: np.ndarray) -> np.ndarray:
@@ -181,3 +181,12 @@ class MinimapColorFilter(Filter):
             combined = cv2.bitwise_or(combined, gold_result)
         
         return combined
+
+
+def gimp_2_opencv(gimp_h: int, gimp_s: int, gimp_v: int) -> Tuple[int, int, int]:
+    # Convert to OpenCV format
+    cv_h = gimp_h / 2
+    cv_s = (gimp_s / 100) * 255
+    cv_v = (gimp_v / 100) * 255
+
+    return int(cv_h), int(cv_s), int(cv_v)

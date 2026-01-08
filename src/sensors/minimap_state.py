@@ -28,15 +28,26 @@ class MinimapStateSensor(Sensor):
     - minimap_hostile_detected: minimap_frame + red/alert color filter (hostile_detected state)
     """
     
-    def __init__(self, roi_cache: ROICache):
+    def __init__(
+        self,
+        roi_cache: ROICache,
+        template_match_threshold: float = 0.09,
+        template_match_method: str = "auto"
+    ):
         """
         Initialize minimap state sensor.
         
         Args:
             roi_cache: ROICache instance for accessing cached minimap ROI
+            template_match_threshold: Threshold for template matching (0.0-1.0)
+                                     Default 0.12 for normalized grayscale matching with opacity variations
+            template_match_method: Matching method to use (currently unused, kept for compatibility)
+                                  "auto" selects best method automatically
         """
         super().__init__("Minimap State Sensor", "Detects minimap frame color (blue/red) for state detection")
         self.roi_cache = roi_cache
+        self.template_match_threshold = template_match_threshold
+        self.template_match_method = template_match_method
         
         # Default minimap dimensions (320x425)
         # These will be adjusted based on actual ROI size in _detect_frame_color
@@ -55,8 +66,8 @@ class MinimapStateSensor(Sensor):
         
         # Inner ellipse radius (to exclude center, keeping only border)
         # Use ~70% of radius to focus on outer 30% border region
-        inner_radius_x = 181 #int(radius_x * 0.7)
-        inner_radius_y = 131 #int(radius_y * 0.7)
+        inner_radius_x = 50 #int(radius_x * 0.7)
+        inner_radius_y = 50 #int(radius_y * 0.7)
         
         # Create outer ellipse mask (keep inside)
         outer_mask = EllipseMaskFilter(
@@ -161,10 +172,16 @@ class MinimapStateSensor(Sensor):
         """
         Detect if the ROI actually contains a minimap by template matching.
         
-        Uses the same mask and color filter preprocessing for both the ROI and template
-        to ensure consistent matching. Applies a combined blue+alert color filter to
-        full-color images before template matching. This prevents false positives from
-        blue sky or red lava that might match color filters.
+        Uses normalized grayscale and edge detection preprocessing on masked images
+        (no color filtering) to handle opacity variations while preserving structure.
+        The minimap border can have variable saturation and value due to opacity,
+        so normalization handles brightness variations better than color filtering.
+        
+        Processing pipeline:
+        1. Apply mask to isolate border region (for both ROI and template)
+        2. Convert to grayscale and normalize for brightness/opacity invariance
+        3. Optionally apply edge detection for structure-based matching
+        4. Match template using normalized grayscale or edge-detected images
         
         Args:
             minimap_image: Extracted minimap ROI image
@@ -178,14 +195,6 @@ class MinimapStateSensor(Sensor):
         if not minimap_frame_filter or not minimap_color_filter:
             # If filters aren't set up, can't verify minimap - return True to allow color check
             return True
-        
-        # Apply the same mask to the ROI image
-        masked_roi = minimap_frame_filter.apply(minimap_image)
-        self.register_debug_output("minimap_precheck_masked_roi", masked_roi)
-        
-        # Apply combined blue+alert color filter to full-color masked ROI
-        roi_color_filtered = minimap_color_filter.apply(masked_roi)
-        self.register_debug_output("minimap_precheck_roi_color_filtered", roi_color_filtered)
         
         # Get template if available
         if not hasattr(self.roi_cache, 'vision') or not self.roi_cache.vision:
@@ -208,25 +217,133 @@ class MinimapStateSensor(Sensor):
             print("Template is larger than ROI, can't match it")
             return False
         
-        # Apply the same mask and color filter to template
+        # Apply the same mask to both ROI and template (no color filtering - it removes too much info)
         # First resize template to ROI size if different
         if template_h != h or template_w != w:
             template_resized = cv2.resize(template, (w, h), interpolation=cv2.INTER_LINEAR)
         else:
             template_resized = template
         
-        # Apply the same minimap_frame mask to template
+        # Apply the same minimap_frame mask to both (don't color filter - preserves structure)
+        masked_roi = minimap_frame_filter.apply(minimap_image)
         masked_template = minimap_frame_filter.apply(template_resized)
-        self.register_debug_output("minimap_precheck_masked_template", masked_template)
         
-        # Apply combined blue+alert color filter to full-color masked template
-        template_color_filtered = minimap_color_filter.apply(masked_template)
-        self.register_debug_output("minimap_precheck_template_color_filtered", template_color_filtered)
+        self.register_debug_output("minimap_precheck_template_masked", masked_template)
+        self.register_debug_output("minimap_precheck_roi_masked", masked_roi)
         
-        # Check for match using template matching on full-color filtered images
-        # cv2.matchTemplate works on multi-channel images (matches each channel and combines)
-        result = cv2.matchTemplate(roi_color_filtered, template_color_filtered, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        # Preprocess for matching: normalize grayscale to handle opacity variations
+        # Try multiple methods and use the best match
+        def preprocess_normalized_grayscale(color_image: np.ndarray) -> np.ndarray:
+            """
+            Preprocess image using normalized grayscale (no edge detection).
+            
+            This method preserves more detail and works better when both images
+            have similar structure but different intensities.
+            
+            Args:
+                color_image: Input BGR image
+                
+            Returns:
+                Normalized grayscale image
+            """
+            # Convert to grayscale
+            gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
+            
+            # Normalize to handle brightness/opacity variations
+            # This helps when the minimap has variable opacity
+            normalized = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+            
+            # Optional: Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+            # This can help with varying opacity levels
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            normalized = clahe.apply(normalized)
+            
+            return normalized
+        
+        def preprocess_edge_detection(color_image: np.ndarray) -> np.ndarray:
+            """
+            Preprocess image using edge detection (Canny with adaptive thresholds).
+            
+            This method focuses on structure/shape rather than intensity.
+            
+            Args:
+                color_image: Input BGR image
+                
+            Returns:
+                Edge-detected grayscale image
+            """
+            # Convert to grayscale
+            gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
+            
+            # Normalize first to handle brightness variations
+            normalized = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+            
+            # Apply adaptive edge detection using Otsu thresholding
+            otsu_val = cv2.threshold(normalized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[0]
+            
+            # Calculate adaptive Canny thresholds based on Otsu value
+            canny_low = max(30, int(otsu_val * 0.5))
+            canny_high = min(200, int(otsu_val * 1.5))
+            
+            # Apply Canny edge detection
+            edges = cv2.Canny(normalized, canny_low, canny_high)
+            
+            # Lightly dilate edges to make them more robust to small variations
+            kernel = np.ones((2, 2), np.uint8)
+            edges = cv2.dilate(edges, kernel, iterations=1)
+            
+            return edges
+        
+        # Preprocess masked ROI and template directly (no color filtering - preserves structure)
+        # The mask already isolates the border region, and normalization handles opacity variations
+        roi_processed = preprocess_normalized_grayscale(masked_roi)
+        template_processed = preprocess_normalized_grayscale(masked_template)
+        
+        # Also try edge detection as alternative
+        roi_edges = preprocess_edge_detection(masked_roi)
+        template_edges = preprocess_edge_detection(masked_template)
+        
+        # Register debug outputs for visualization
+        roi_processed_bgr = cv2.cvtColor(roi_processed, cv2.COLOR_GRAY2BGR)
+        template_processed_bgr = cv2.cvtColor(template_processed, cv2.COLOR_GRAY2BGR)
+        roi_edges_bgr = cv2.cvtColor(roi_edges, cv2.COLOR_GRAY2BGR)
+        template_edges_bgr = cv2.cvtColor(template_edges, cv2.COLOR_GRAY2BGR)
+        self.register_debug_output("minimap_precheck_roi_normalized", roi_processed_bgr)
+        self.register_debug_output("minimap_precheck_template_normalized", template_processed_bgr)
+        self.register_debug_output("minimap_precheck_roi_edges", roi_edges_bgr)
+        self.register_debug_output("minimap_precheck_template_edges", template_edges_bgr)
+        
+        # Try matching with normalized grayscale (primary method)
+        result_normalized = cv2.matchTemplate(roi_processed, template_processed, cv2.TM_CCOEFF_NORMED)
+        _, max_val_normalized, _, max_loc_normalized = cv2.minMaxLoc(result_normalized)
+        
+        # Try edge detection as alternative
+        result_edges = cv2.matchTemplate(roi_edges, template_edges, cv2.TM_CCOEFF_NORMED)
+        _, max_val_edges, _, max_loc_edges = cv2.minMaxLoc(result_edges)
+        
+        # Try alternative template matching methods (different algorithms work better for different images)
+        result_ccorr = cv2.matchTemplate(roi_processed, template_processed, cv2.TM_CCORR_NORMED)
+        _, max_val_ccorr, _, max_loc_ccorr = cv2.minMaxLoc(result_ccorr)
+        
+        # Use the best match between normalized and ccorr (both preserve structure)
+        # ccorr can sometimes work better for images with varying brightness
+        if max_val_ccorr > max_val_normalized:
+            max_val = max_val_ccorr
+            max_loc = max_loc_ccorr
+            result = result_ccorr
+            method_used = "normalized_ccorr"
+        elif max_val_normalized >= max_val_edges:
+            max_val = max_val_normalized
+            max_loc = max_loc_normalized
+            result = result_normalized
+            method_used = "normalized_grayscale"
+        else:
+            max_val = max_val_edges
+            max_loc = max_loc_edges
+            result = result_edges
+            method_used = "edge_detection"
+        
+        # print(f"[Minimap State Sensor] Match scores - normalized: {max_val_normalized:.3f}, ccorr: {max_val_ccorr:.3f}, edges: {max_val_edges:.3f}, using: {method_used} ({max_val:.3f})")
         
         # Normalize match result to 0-255 range for visualization
         match_result_viz = cv2.normalize(result, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
@@ -236,21 +353,27 @@ class MinimapStateSensor(Sensor):
         self.register_debug_output("minimap_precheck_match_result", match_result_viz_bgr)
         
         # Create annotated visualization with sensor data
-        threshold = 0.3
+        # Use configured threshold (edge-based matching typically needs lower thresholds)
+        threshold = self.template_match_threshold
         match_passed = max_val >= threshold
         status_color = (0, 255, 0) if match_passed else (0, 0, 255)
         status_text = "PASS" if match_passed else "FAIL"
         
         # Create visualization image showing match data
-        viz_height = max(roi_color_filtered.shape[0], 150)
-        viz_width = roi_color_filtered.shape[1]
+        # Use the winning method's image for display
+        if method_used in ("normalized_grayscale", "normalized_ccorr"):
+            roi_display = roi_processed_bgr
+        else:
+            roi_display = roi_edges_bgr
+        viz_height = max(roi_display.shape[0], 150)
+        viz_width = roi_display.shape[1]
         sensor_data_viz = np.zeros((viz_height, viz_width, 3), dtype=np.uint8)
         
-        # Place color-filtered ROI on top
-        sensor_data_viz[:roi_color_filtered.shape[0], :roi_color_filtered.shape[1]] = roi_color_filtered
+        # Place processed ROI on top
+        sensor_data_viz[:roi_display.shape[0], :roi_display.shape[1]] = roi_display
         
         # Add text annotations with sensor data
-        y_offset = roi_color_filtered.shape[0] + 20
+        y_offset = roi_display.shape[0] + 20
         cv2.putText(sensor_data_viz, f"Match Value: {max_val:.3f}", (10, y_offset),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         cv2.putText(sensor_data_viz, f"Threshold: {threshold:.3f}", (10, y_offset + 25),
@@ -259,6 +382,8 @@ class MinimapStateSensor(Sensor):
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
         cv2.putText(sensor_data_viz, f"Match Location: {max_loc}", (10, y_offset + 75),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(sensor_data_viz, f"Method: {method_used}", (10, y_offset + 100),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
         
         self.register_debug_output("minimap_precheck_sensor_data", sensor_data_viz)
         
@@ -316,9 +441,12 @@ class MinimapStateSensor(Sensor):
         
         blue_ratio = blue_count / total_border_pixels
         red_ratio = red_count / total_border_pixels
-        
+
+        # print(f"Blue Ratio: {blue_ratio:.3f}, Red Ratio: {red_ratio:.3f}")
+        # print(f"Blue Count: {blue_count}, Red Count: {red_count}")
+        # print(f"Total Border Pixels: {total_border_pixels}")    
         # Threshold for detection (at least 5% of border pixels must match)
-        threshold = 0.05
+        threshold = 0.005
         
         # Determine detected state
         detected_state = None

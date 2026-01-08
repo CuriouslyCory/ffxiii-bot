@@ -628,7 +628,8 @@ class RandomMovementPlayer:
             # Start a new turn
             self.is_turning = True
             # 1 in 5 chance (20%) to turn left, otherwise turn right
-            self.turn_direction = -1 if random.random() < 0.2 else 1
+            self.turn_direction = 1
+            # self.turn_direction = -1 if random.random() < 0.2 else 1
             turn_duration = random.uniform(RANDOM_TURN_DURATION_MIN, RANDOM_TURN_DURATION_MAX)
             self.turn_end_time = current_time + turn_duration
             direction_str = "left" if self.turn_direction < 0 else "right"

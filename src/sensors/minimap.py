@@ -44,7 +44,8 @@ class MinimapSensor(Sensor):
         if "minimap_outline" not in self.vision.templates:
             return False
         
-        match = self.vision.find_template("minimap_outline", image, threshold=0.3, roi=search_roi)
+        match = self.vision.find_template("minimap_outline", image, threshold=0.5, roi=search_roi)
+        print(f"[Calibrate] Minimap outline match: {match}")
         
         if match:
             mx, my, conf = match

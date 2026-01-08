@@ -31,7 +31,16 @@ class StateManager:
         # Register common ROIs
         # Minimap ROI: (x, y, width, height) - no stretching for base extraction
         self.roi_cache.register_roi("minimap", (1375, 57,  425, 320))
-        self.roi_cache.register_roi("minimap_center_arrow", (1575, 203, 30, 30))
+        self.roi_cache.register_roi("minimap_center_arrow", (1575, 202, 30, 30))
+        
+        # Hostile clock ROI: bottom 50% of screen, middle 33% horizontally
+        # Use vision engine's resolution: (width, height)
+        width, height = vision.resolution
+        hostile_clock_width = int(width * 0.33)
+        hostile_clock_x = (width - hostile_clock_width) // 2
+        hostile_clock_y = height // 2  # Bottom 50%
+        hostile_clock_height = height // 2
+        self.roi_cache.register_roi("hostile_clock", (hostile_clock_x, hostile_clock_y, hostile_clock_width, hostile_clock_height))
 
     def add_state(self, state: State):
         """

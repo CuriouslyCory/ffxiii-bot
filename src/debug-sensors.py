@@ -42,23 +42,37 @@ class FilterParameterController:
     
     def __init__(self):
         """Initialize filter parameter controller."""
-        self.window_name = "Filter Parameters"
+        self.base_window_name = "Filter Parameters"
+        self.window_name = self.base_window_name
         self.trackbar_values: Dict[str, Dict[str, int]] = {}
         self.filter_references: Dict[str, Filter] = {}
         self._trackbar_created = False
+        self._current_sensor_name: Optional[str] = None
     
-    def setup_filter_controls(self, filters: Dict[str, Filter], roi_image: Optional[np.ndarray]):
+    def setup_filter_controls(self, filters: Dict[str, Filter], roi_image: Optional[np.ndarray], sensor_name: Optional[str] = None):
         """
         Set up filter parameter controls for registered filters.
         
         Args:
             filters: Dictionary of filter names to Filter instances
             roi_image: ROI image for determining mask parameter bounds (optional)
+            sensor_name: Name of the sensor (for unique window naming)
         """
-        # Clear existing trackbars
+        # Clear existing trackbars and window
         if self._trackbar_created:
-            cv2.destroyWindow(self.window_name)
+            try:
+                cv2.destroyWindow(self.window_name)
+            except cv2.error:
+                pass  # Window might not exist
             self._trackbar_created = False
+        
+        # Use unique window name per sensor to avoid trackbar conflicts
+        if sensor_name:
+            self.window_name = f"{self.base_window_name} - {sensor_name}"
+            self._current_sensor_name = sensor_name
+        else:
+            self.window_name = self.base_window_name
+            self._current_sensor_name = None
         
         self.filter_references = filters
         self.trackbar_values = {}
@@ -66,7 +80,7 @@ class FilterParameterController:
         if not filters:
             return
         
-        # Create window for trackbars
+        # Create window for trackbars with unique name
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(self.window_name, 400, 600)
         
@@ -379,6 +393,50 @@ class FilterParameterController:
             self._trackbar_created = False
 
 
+def add_enemy_position_markers(debug_outputs: Dict[str, np.ndarray], result: Any) -> Dict[str, np.ndarray]:
+    """
+    Add visual markers to EnemyPositionSensor debug outputs.
+    
+    Adds a green dot at the center and a blue dot at the calculated enemy position.
+    
+    Args:
+        debug_outputs: Dictionary mapping labels to debug images
+        result: Sensor result (dx, dy) offset tuple or None
+        
+    Returns:
+        Modified debug outputs dictionary with markers added
+    """
+    if "filtered_enemies" not in debug_outputs:
+        return debug_outputs
+    
+    # Get the filtered enemies image
+    filtered_img = debug_outputs["filtered_enemies"].copy()
+    h, w = filtered_img.shape[:2]
+    
+    # Calculate center
+    center_x = w // 2
+    center_y = h // 2
+    
+    # Draw green dot at center
+    cv2.circle(filtered_img, (center_x, center_y), 5, (0, 255, 0), -1)
+    
+    # Draw blue dot at enemy position if result is available
+    if result is not None and isinstance(result, tuple) and len(result) == 2:
+        dx, dy = result
+        enemy_x = center_x + dx
+        enemy_y = center_y + dy
+        
+        # Only draw if within image bounds
+        if 0 <= enemy_x < w and 0 <= enemy_y < h:
+            cv2.circle(filtered_img, (enemy_x, enemy_y), 5, (255, 0, 0), -1)
+    
+    # Update the debug output
+    debug_outputs = debug_outputs.copy()
+    debug_outputs["filtered_enemies"] = filtered_img
+    
+    return debug_outputs
+
+
 def create_debug_outputs_display(debug_outputs: Dict[str, np.ndarray], max_width: int = 400) -> Optional[np.ndarray]:
     """
     Create a grid display of debug output images.
@@ -393,25 +451,30 @@ def create_debug_outputs_display(debug_outputs: Dict[str, np.ndarray], max_width
     if not debug_outputs:
         return None
     
-    # Resize all images to consistent size
+    # Determine grid layout first to calculate size constraints
+    num_images = len(debug_outputs)
+    cols = 2
+    rows = (num_images + cols - 1) // cols
+    
+    # Limit maximum canvas height to prevent overflow (~1200px leaves room for monitor)
+    max_canvas_height = 1200
+    max_image_height = (max_canvas_height // rows) - 30  # -30 for label text
+    
+    # Resize all images to consistent size, respecting height constraint
     resized_images = []
     labels = list(debug_outputs.keys())
     
     for label in labels:
         img = debug_outputs[label]
         h, w = img.shape[:2]
-        scale = min(max_width / w, max_width / h, 1.0)
+        # Scale based on both width and height constraints
+        scale = min(max_width / w, max_image_height / h, 1.0)
         new_w = int(w * scale)
         new_h = int(h * scale)
         resized = cv2.resize(img, (new_w, new_h))
         resized_images.append((label, resized))
     
-    # Determine grid layout (2 columns)
-    num_images = len(resized_images)
-    cols = 2
-    rows = (num_images + cols - 1) // cols
-    
-    # Find maximum dimensions
+    # Find maximum dimensions after resizing
     max_h = max(img.shape[0] for _, img in resized_images)
     max_w = max(img.shape[1] for _, img in resized_images)
     
@@ -472,14 +535,14 @@ class SensorTester:
         
         # Health Sensor (needs vision engine and HP bar ROIs)
         hp_bar_rois = [
-            (1450, 850, 200, 10),  # Char 1
-            (1450, 880, 200, 10),  # Char 2
-            (1450, 910, 200, 10),  # Char 3
+            (1190, 845, 360, 10),  # Char 1
+            (1160, 900, 360, 10),  # Char 2
+            (1110, 950, 360, 10),  # Char 3
         ]
         self.sensors["HealthSensor"] = HealthSensor(self.vision, hp_bar_rois)
         
         # Minimap Sensor (needs vision engine and ROI)
-        self.sensors["MinimapSensor"] = MinimapSensor(self.vision, roi=(1375, 57, 425, 320))
+        # self.sensors["MinimapSensor"] = MinimapSensor(self.vision, roi=(1375, 57, 425, 320))
         
         # Compass Sensor (needs vision engine)
         self.sensors["CompassSensor"] = CompassSensor(self.vision)
@@ -512,9 +575,9 @@ class SensorTester:
         if sensor_name in self.sensors:
             self.current_sensor = self.sensors[sensor_name]
             
-            # Set up filter controls for this sensor
+            # Set up filter controls for this sensor with sensor name for unique window
             registered_filters = self.current_sensor.get_registered_filters()
-            self.filter_controller.setup_filter_controls(registered_filters, roi_image)
+            self.filter_controller.setup_filter_controls(registered_filters, roi_image, sensor_name)
             
             return True
         return False
@@ -784,7 +847,7 @@ def main():
     vision = VisionEngine(window_offset=WINDOW_OFFSET, resolution=RESOLUTION)
     roi_cache = ROICache(vision)
     roi_cache.register_roi("minimap", (1375, 57, 425, 320))
-    roi_cache.register_roi("minimap_center_arrow", (1575, 203, 30, 30))
+    roi_cache.register_roi("minimap_center_arrow", (1575, 202, 30, 30))
     
     # Load templates that sensors might need
     template_dir = "templates"
@@ -860,6 +923,9 @@ def main():
                         # Display debug outputs if available
                         debug_outputs = sensor_tester.current_sensor.get_debug_outputs()
                         if debug_outputs:
+                            # Add markers for EnemyPositionSensor
+                            if sensor_name == "EnemyPositionSensor":
+                                debug_outputs = add_enemy_position_markers(debug_outputs, result)
                             debug_display = create_debug_outputs_display(debug_outputs)
                             if debug_display is not None:
                                 cv2.imshow("Debug Outputs", debug_display)
@@ -931,6 +997,9 @@ def main():
                     # Display debug outputs if available
                     debug_outputs = sensor_tester.current_sensor.get_debug_outputs()
                     if debug_outputs:
+                        # Add markers for EnemyPositionSensor
+                        if sensor_name == "EnemyPositionSensor":
+                            debug_outputs = add_enemy_position_markers(debug_outputs, result)
                         debug_display = create_debug_outputs_display(debug_outputs)
                         if debug_display is not None:
                             cv2.imshow("Debug Outputs", debug_display)

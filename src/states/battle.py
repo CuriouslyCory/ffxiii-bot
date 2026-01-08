@@ -26,10 +26,10 @@ class BattleState(State):
         # Sensors
         self.health_sensor = HealthSensor(
             self.vision,
-            hp_bar_rois=[
-                (1450, 850, 200, 10),  # Char 1
-                (1450, 880, 200, 10),  # Char 2
-                (1450, 910, 200, 10),  # Char 3
+            hp_bar_rois = [
+                (1190, 845, 360, 10),  # Char 1
+                (1160, 900, 360, 10),  # Char 2
+                (1110, 950, 360, 10),  # Char 3
             ]
         )
         

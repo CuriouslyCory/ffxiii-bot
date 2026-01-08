@@ -85,15 +85,65 @@ class PlayerDirectionSensor(Sensor):
         cy = int(M["m01"] / M["m00"])
         centroid = (cx, cy)
         
-        # Find tip (furthest point from centroid) - this is the V-shape tip
-        max_d = -1
-        tip = centroid
-        for pt in main_contour:
-            px, py = pt[0]
-            d = (px - cx) ** 2 + (py - cy) ** 2
-            if d > max_d:
-                max_d = d
-                tip = (px, py)
+        # Create debug output with visualization dots
+        arrow_roi_with_dots = arrow_roi.copy()
+        # Green dot at the center of the minimap_center_arrow ROI
+        center_x = arrow_roi.shape[1] // 2
+        center_y = arrow_roi.shape[0] // 2
+        cv2.circle(arrow_roi_with_dots, (center_x, center_y), 2, (0, 255, 0), -1)
+        # Blue dot at the centroid (cx, cy)
+        cv2.circle(arrow_roi_with_dots, (cx, cy), 2, (255, 0, 0), -1)
+        
+        # Find tip using convex hull and angle analysis
+        # The tip should be the sharpest vertex (smallest internal angle) on the convex hull
+        hull = cv2.convexHull(main_contour, returnPoints=True)
+        
+        if len(hull) < 3:
+            # Fallback to furthest point from centroid if hull is degenerate
+            max_d = -1
+            tip = centroid
+            for pt in main_contour:
+                px, py = pt[0]
+                d = (px - cx) ** 2 + (py - cy) ** 2
+                if d > max_d:
+                    max_d = d
+                    tip = (px, py)
+        else:
+            # Find the vertex with the sharpest angle (smallest internal angle)
+            min_angle = float('inf')
+            tip_idx = 0
+            tip = (hull[0][0][0], hull[0][0][1])
+            
+            for i in range(len(hull)):
+                # Get three consecutive points on the hull
+                p1 = hull[(i - 1) % len(hull)][0]  # Previous point
+                p2 = hull[i][0]                     # Current point (candidate tip)
+                p3 = hull[(i + 1) % len(hull)][0]  # Next point
+                
+                # Calculate vectors from p2 to p1 and p2 to p3
+                v1 = p1 - p2
+                v2 = p3 - p2
+                
+                # Calculate the angle between the two vectors
+                # Use dot product: cos(angle) = (v1 · v2) / (|v1| * |v2|)
+                dot_product = v1[0] * v2[0] + v1[1] * v2[1]
+                norm1 = np.sqrt(v1[0]**2 + v1[1]**2)
+                norm2 = np.sqrt(v2[0]**2 + v2[1]**2)
+                
+                if norm1 > 0 and norm2 > 0:
+                    cos_angle = dot_product / (norm1 * norm2)
+                    # Clamp to [-1, 1] to avoid numerical errors
+                    cos_angle = np.clip(cos_angle, -1.0, 1.0)
+                    angle = np.arccos(cos_angle)  # Angle in radians
+                    
+                    # Smaller angle = sharper point = more likely to be the tip
+                    if angle < min_angle:
+                        min_angle = angle
+                        tip_idx = i
+                        tip = (int(p2[0]), int(p2[1]))
+        
+        cv2.circle(arrow_roi_with_dots, tip, 2, (0, 0, 255), -1)
+        self.register_debug_output("arrow_roi_with_markers", arrow_roi_with_dots)
         
         # Calculate angle from centroid to tip
         # In image coordinates: X increases right, Y increases down
@@ -130,3 +180,4 @@ class PlayerDirectionSensor(Sensor):
         
         arrow_roi = self.roi_cache.get_roi("minimap_center_arrow", image)
         return arrow_roi is not None
+
